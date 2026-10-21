@@ -40,48 +40,40 @@ machine-network-control/
 │   ├── client/
 │   │   ├── readonly_wrapper.py     # 3. جدار حماية القراءة فقط (Read-Only Firewall)
 │   │   └── rate_limiter.py         # محدد معدل الطلبات لحماية دورة المعالج
+│   ├── reporting/
+│   │   └── report_generator.py     # 4. مولد التقارير الشاملة (Excel + Markdown)
 │   ├── backup/
-│   │   └── plc_snapshot.py         # 4. أخذ نسخ احتياطية للمتغيرات والبلوكات للقراءة فقط
+│   │   └── plc_snapshot.py         # 5. أخذ نسخ احتياطية للمتغيرات والبلوكات للقراءة فقط
 │   ├── acquisition/
-│   │   ├── poller.py               # 5. محرك السحب فائق السرعة المتزامن زمنياً
+│   │   ├── poller.py               # 6. محرك السحب فائق السرعة المتزامن زمنياً
 │   │   └── storage_engine.py       # محرك التخزين المفصول (DuckDB & Parquet)
 │   ├── analytics/
-│   │   └── cycle_analyzer.py       # 6. تحليل دورات الماكينة وكشف شذوذ الأداء
+│   │   └── cycle_analyzer.py       # 7. تحليل دورات الماكينة وكشف شذوذ الأداء
 │   └── simulator/
-│       └── mock_plc_server.py      # 7. محاكي ماكينة صناعية للاختبار الآمن محلياً
+│       └── mock_plc_server.py      # 8. محاكي ماكينة صناعية للاختبار الآمن محلياً
 ├── ui/
-│   └── dashboard.py                # لوحة المراقبة الحية (FastAPI + WebSockets)
+│   └── dashboard.py                # لوحة المراقبة التفاعلية الشاملة (Web Portal)
 ├── tests/
 │   └── test_safety_and_pipeline.py # الاختبارات الآلية الشاملة
 ├── requirements.txt                # المكتبات البرمجية المطلوبة
-└── main.py                         # واجهة سطر الأوامر المركزية (CLI Orchestrator)
+└── main.py                         # المدخل الرئيسي للتشغيل التلقائي
 ```
 
 ---
 
-## 🚀 دليل التشغيل السريع (Quickstart Guide)
+## 🚀 دليل التشغيل بنقرة واحدة (1-Click Web Portal - Zero Terminal)
 
-### 1. تثبيت المتطلبات (Installation)
+ببساطة، شغل الأمر التالي بدون أي معاملات:
 ```powershell
-pip install -r requirements.txt
+python main.py
 ```
-
-### 2. اختبار جدار الحماية والأمان (Safety Audit)
-للتأكد عملياً من أن البرنامج يحظر أي محاولة كتابة أو تعديل:
-```powershell
-python main.py test-safety
-```
-
-### 3. تشغيل المحاكي الافتراضي للاختبار الآمن (Simulation Mode)
-لتشغيل ماكينة صناعية افتراضية على جهازك دون الحاجة لماكينة حقيقية:
-```powershell
-python main.py simulate --port 5020
-```
-
-### 4. فحص واكتشاف PLC في المصنع (Protocol Probe)
-```powershell
-python main.py probe --host 192.168.1.50
-```
+ثم افتح متصفحك على: **`http://localhost:8088`** لتجد الواجهة التفاعلية الكاملة:
+1. اضغط زر **[ 🚀 بدء الفحص الآلي الشامل للماكينة ]**.
+2. يقوم النظام بفحص المعالج والمنافذ وسرعة الاستجابة تلقائياً ويعرض شريط تقدم حي.
+3. فور الانتهاء، يظهر زران لتحميل:
+   - **📥 تقرير Excel مفصل ومنسق بالكامل (`.xlsx`).**
+   - **📄 تقرير Text / Markdown جاهز للقراءة والتحليل (`.md`).**
+4. يمكنك إرسال التقرير للمهندس أو الذكاء الاصطناعي لفهم أفضل استراتيجية ربط فوراً.
 
 ### 5. استخراج العناوين من كابتشر Wireshark (PCAP Memory Mapping)
 ```powershell

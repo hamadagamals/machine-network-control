@@ -13,6 +13,8 @@ data/telemetry/parquet/*.parquet
 data/captures/*.pcapng
 data/captures/*.pcap
 data/snapshots/*.bin
+data/reports/*.xlsx
+data/reports/*.md
 
 # IDE & OS
 .vscode/

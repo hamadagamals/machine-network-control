@@ -233,6 +233,11 @@ def main():
     p_mon.add_argument("--port", type=int, default=None, help="Override Port")
     p_mon.add_argument("--dashboard", action="store_true", help="Launch live web dashboard")
 
+    # gui (Default)
+    p_gui = subparsers.add_parser("gui", help="Launch interactive 1-click web portal (Default)")
+    p_gui.add_argument("--host", default="0.0.0.0", help="Web portal host")
+    p_gui.add_argument("--port", type=int, default=8088, help="Web portal port")
+
     args = parser.parse_args()
     if args.command == "probe":
         cmd_probe(args)
@@ -244,6 +249,16 @@ def main():
         cmd_simulate(args)
     elif args.command == "monitor":
         cmd_monitor(args)
+    elif args.command == "gui" or args.command is None:
+        import uvicorn
+        port = getattr(args, "port", 8088) or 8088
+        host = getattr(args, "host", "0.0.0.0") or "0.0.0.0"
+        console.print(Panel(
+            f"[bold green]Starting Machine Network Control - Automated Web Portal[/bold green]\n"
+            f"Open your browser at: [bold cyan]http://localhost:{port}[/bold cyan]\n"
+            f"Zero Terminal Interaction Required. Click and Control from the Browser."
+        ))
+        uvicorn.run(fastapi_app, host=host, port=port)
     else:
         parser.print_help()
 
