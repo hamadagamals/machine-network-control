@@ -1,0 +1,53 @@
+{
+  "station": {
+    "name": "Machine-01-HydraulicPress",
+    "line": "Line-A",
+    "plant_zone": "Zone-1"
+  },
+  "target_plc": {
+    "ip_address": "127.0.0.1",
+    "protocol": "modbus_tcp",
+    "port": 5020,
+    "modbus": {
+      "unit_id": 1,
+      "timeout": 2.0
+    }
+  },
+  "safety": {
+    "strict_read_only": true,
+    "max_requests_per_second": 50.0,
+    "connect_timeout_seconds": 2.0,
+    "reconnect_backoff_max_seconds": 30.0
+  },
+  "polling": {
+    "tier_1_high_frequency_ms": 50,
+    "tier_2_medium_frequency_ms": 1000,
+    "tier_3_low_frequency_ms": 10000
+  },
+  "storage": {
+    "engine": "duckdb_parquet",
+    "db_path": "data/telemetry/machine_telemetry.duckdb",
+    "parquet_export_dir": "data/telemetry/parquet",
+    "flush_interval_seconds": 10,
+    "partition_by": "hourly"
+  },
+  "cycle_analysis": {
+    "trigger_type": "state_register",
+    "trigger_tag": "machine_state",
+    "active_state_values": [1, 2, 3],
+    "idle_state_value": 0,
+    "min_cycle_duration_seconds": 1.0,
+    "debounce_ms": 100,
+    "golden_cycle": {
+      "expected_duration_seconds": 12.5,
+      "duration_tolerance_percent": 15.0,
+      "max_peak_current_amps": 45.0,
+      "max_hydraulic_pressure_bar": 180.0
+    }
+  },
+  "dashboard": {
+    "host": "0.0.0.0",
+    "port": 8088,
+    "websocket_rate_hz": 10
+  }
+}

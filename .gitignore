@@ -1,0 +1,21 @@
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+
+# Telemetry raw outputs & databases (keep repo light)
+data/telemetry/*.duckdb*
+data/telemetry/parquet/*.parquet
+data/captures/*.pcapng
+data/captures/*.pcap
+data/snapshots/*.bin
+
+# IDE & OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

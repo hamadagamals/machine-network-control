@@ -1,0 +1,71 @@
+# ==============================================================================
+# INDUSTRIAL PLC DATA EXTRACTION & CYCLE ANALYSIS CONFIGURATION
+# STRICTLY READ-ONLY ARCHITECTURE (ZERO PLANT IMPACT)
+# ==============================================================================
+
+station:
+  name: "Machine-01-HydraulicPress"
+  line: "Line-A"
+  plant_zone: "Zone-1"
+
+# Target Industrial Controller
+target_plc:
+  ip_address: "127.0.0.1"        # Change to field PLC IP (e.g., 192.168.1.50)
+  protocol: "modbus_tcp"         # Options: modbus_tcp, s7comm, ethernet_ip, opcua
+  port: 502                      # 502 (Modbus), 102 (S7comm), 44818 (CIP), 4840 (OPC UA)
+  
+  # Protocol-specific options:
+  modbus:
+    unit_id: 1
+    timeout: 2.0
+  s7:
+    rack: 0
+    slot: 1                      # 1 for S7-1200/1500, 2 for S7-300/400
+  ethernet_ip:
+    slot: 0
+    route_path: null             # Optional backplane routing path (e.g., "1/0")
+  opcua:
+    security_policy: "None"      # Read-only observation profile
+
+# Operational Safety & Guardrails
+safety:
+  strict_read_only: true         # HARD LOCK: Blocks any write/force/state telegram at runtime
+  max_requests_per_second: 50    # Prevents CPU communication starvation
+  connect_timeout_seconds: 2.0
+  reconnect_backoff_max_seconds: 30.0
+
+# Tiered Polling Scheduling
+polling:
+  tier_1_high_frequency_ms: 50   # 20ms - 100ms: Cycle triggers, state registers, fast pressures
+  tier_2_medium_frequency_ms: 1000 # 1s: Process temperatures, tank levels, flow rates
+  tier_3_low_frequency_ms: 10000  # 10s: Total counters, recipes, diagnostics
+
+# High-Performance Decoupled Storage
+storage:
+  engine: "duckdb_parquet"       # Storage engine: duckdb_parquet or csv
+  db_path: "data/telemetry/machine_telemetry.duckdb"
+  parquet_export_dir: "data/telemetry/parquet"
+  flush_interval_seconds: 10     # Interval to flush memory buffer to storage
+  partition_by: "hourly"         # hourly or daily
+
+# Machine Cycle Analysis & Anomaly Detection
+cycle_analysis:
+  trigger_type: "state_register" # Options: state_register, discrete_bit, counter_increment
+  trigger_tag: "machine_state"   # Tag or register to observe
+  active_state_values: [1, 2, 3] # State numbers representing active production
+  idle_state_value: 0
+  min_cycle_duration_seconds: 1.0
+  debounce_ms: 100               # Filter out electrical noise spikes
+  
+  # Golden Cycle Baselines for Anomaly Detection
+  golden_cycle:
+    expected_duration_seconds: 12.5
+    duration_tolerance_percent: 15.0
+    max_peak_current_amps: 45.0
+    max_hydraulic_pressure_bar: 180.0
+
+# Real-Time Web Dashboard
+dashboard:
+  host: "0.0.0.0"
+  port: 8088
+  websocket_rate_hz: 10
