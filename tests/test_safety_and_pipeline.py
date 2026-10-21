@@ -87,3 +87,32 @@ def test_mock_plc_server():
         client.disconnect()
     finally:
         server.stop()
+
+
+def test_wire_level_write_block():
+    """Confirms that low-level socket driver physically rejects write commands."""
+    from plc_extractor.client.readonly_wrapper import _PureSocketModbusClient
+
+    raw_socket_client = _PureSocketModbusClient("127.0.0.1", port=5022)
+    # 1. Method attribute block
+    with pytest.raises(PLCWriteAttemptBlockedError):
+        raw_socket_client.write_register(0, 100)
+
+    # 2. Wire egress code assertion block
+    with pytest.raises(PLCWriteAttemptBlockedError):
+        raw_socket_client._execute_read_query(func_code=0x06, address=0, count=1)
+
+
+def test_unreachable_offline_diagnostics():
+    """Confirms that offline/unreachable PLCs are flagged safely without fake data."""
+    from plc_extractor.scanner.auto_diagnostics import AutoDiagnosticsEngine
+
+    engine = AutoDiagnosticsEngine(target_host="192.0.2.1", station_name="OfflineUnit")
+    res = engine.run_full_diagnostic()
+
+    assert res["status"] == "UNREACHABLE"
+    assert res["avg_latency_ms"] == 0.0
+    assert res["total_tags_count"] == 0
+    assert len(res["tags"]) == 0
+    assert os.path.exists(res["excel_report_path"])
+    assert os.path.exists(res["markdown_report_path"])

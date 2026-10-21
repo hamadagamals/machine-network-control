@@ -45,6 +45,20 @@ live_telemetry: Dict[str, Any] = {
 completed_cycles: List[Dict[str, Any]] = []
 connected_websockets: List[WebSocket] = []
 
+
+def update_live_telemetry(record: Dict[str, Any]):
+    """Updates global live telemetry dictionary."""
+    global live_telemetry
+    live_telemetry.update(record)
+
+
+def add_completed_cycle(cycle_kpi: Dict[str, Any]):
+    """Appends a newly completed cycle KPI."""
+    global completed_cycles
+    completed_cycles.insert(0, cycle_kpi)
+    if len(completed_cycles) > 30:
+        completed_cycles.pop()
+
 # Background Services
 mock_plc_instance: Optional[MockIndustrialMachinePLC] = None
 poller_instance: Optional[TieredPoller] = None

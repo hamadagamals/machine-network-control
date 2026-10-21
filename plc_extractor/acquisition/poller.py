@@ -153,8 +153,14 @@ class TieredPoller:
                 self._metrics["avg_latency_ms"] = round(sum(latencies) / len(latencies), 2)
 
             except Exception as e:
-                logger.error(f"Polling cycle error: {e}")
-                time.sleep(0.5)
+                logger.warning(f"Polling cycle interrupted: {e}. Attempting safe reconnection in 1.0s...")
+                time.sleep(1.0)
+                try:
+                    self.client.disconnect()
+                    self.client.connect()
+                except Exception:
+                    pass
+                next_tick = time.perf_counter()
 
             # ------------------------------------------------------------------
             # DRIFT-COMPENSATED MONOTONIC SLEEP

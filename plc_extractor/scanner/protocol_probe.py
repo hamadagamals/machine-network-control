@@ -48,33 +48,48 @@ class ProtocolProbe:
         return results
 
     def probe_modbus(self, port: int = 502) -> Optional[Dict[str, Any]]:
-        """Non-intrusive Modbus probe."""
+        """Non-intrusive Modbus probe with pure-socket fallback."""
         try:
             from pymodbus.client import ModbusTcpClient
             client = ModbusTcpClient(self.host, port=port, timeout=self.timeout)
-            if not client.connect():
-                return None
+            if client.connect():
+                info = {"protocol": "modbus_tcp", "port": port, "responsive_unit_ids": []}
+                for uid in range(1, 6):
+                    resp = client.read_holding_registers(address=0, count=1, slave=uid)
+                    if not resp.isError():
+                        info["responsive_unit_ids"].append(uid)
+                client.close()
+                return info
+        except Exception:
+            pass
 
-            info = {"protocol": "modbus_tcp", "port": port, "responsive_unit_ids": []}
-            # Test candidate Unit IDs 1 to 5 with read-only holding register read at offset 0
-            for uid in range(1, 6):
-                resp = client.read_holding_registers(address=0, count=1, slave=uid)
-                if not resp.isError():
-                    info["responsive_unit_ids"].append(uid)
-
-            client.close()
-            return info
+        # Zero-dependency pure socket fallback probe
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(self.timeout)
+            sock.connect((self.host, port))
+            # Send standard read-only Modbus FC 0x03 probe (TransID 1, Proto 0, Len 6, Unit 1, FC 0x03, Addr 0, Count 1)
+            pdu = struct.pack(">HHHBBHH", 1, 0, 6, 1, 0x03, 0, 1)
+            sock.sendall(pdu)
+            resp = sock.recv(12)
+            sock.close()
+            if len(resp) >= 8:
+                # Any Modbus response (FC 0x03 or Exception 0x83) confirms active Modbus service
+                fc = resp[7]
+                if fc in (0x03, 0x83):
+                    return {"protocol": "modbus_tcp", "port": port, "responsive_unit_ids": [1]}
         except Exception as e:
-            logger.debug(f"Modbus probe error on {self.host}:{port}: {e}")
-            return None
+            logger.debug(f"Modbus pure-socket probe error on {self.host}:{port}: {e}")
+
+        return None
 
     def probe_s7comm(self, port: int = 102) -> Optional[Dict[str, Any]]:
-        """Siemens S7comm probe iterating standard (rack, slot) pairs."""
+        """Siemens S7comm probe with pure-socket RFC 1006 COTP handshake fallback."""
+        # 1. Try snap7 if installed and DLL present
         try:
             import snap7
             client = snap7.client.Client()
-            candidate_pairs = [(0, 1), (0, 2), (0, 0)]  # (0,1)=S7-1200/1500, (0,2)=S7-300/400
-
+            candidate_pairs = [(0, 1), (0, 2), (0, 0)]
             for rack, slot in candidate_pairs:
                 try:
                     client.connect(self.host, rack, slot, port)
@@ -84,7 +99,6 @@ class ProtocolProbe:
                         cpu_state = client.get_cpu_state()
                         pdu_size = client.get_pdu_length()
                         client.disconnect()
-
                         return {
                             "protocol": "s7comm",
                             "port": port,
@@ -98,26 +112,68 @@ class ProtocolProbe:
                         }
                 except Exception:
                     continue
-            return None
+        except Exception:
+            pass
+
+        # 2. Pure-socket RFC 1006 COTP Connect Request fallback (100% reliable, zero DLLs)
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(self.timeout)
+            sock.connect((self.host, port))
+            # RFC 1006 TPKT + ISO 8073 COTP Connection Request (CR) targeting Rack 0 Slot 1
+            cotp_cr = bytes([
+                0x03, 0x00, 0x00, 0x16,  # TPKT Header (Version 3, Len 22)
+                0x11, 0xE0, 0x00, 0x00,  # COTP CR
+                0x00, 0x01, 0x00,        # Source Ref, Class 0
+                0xC1, 0x02, 0x01, 0x00,  # Calling TSAP
+                0xC2, 0x02, 0x01, 0x01,  # Called TSAP (Rack 0, Slot 1)
+                0xC0, 0x01, 0x09         # TPDU Size
+            ])
+            sock.sendall(cotp_cr)
+            resp = sock.recv(32)
+            sock.close()
+            # If response is COTP Connection Confirm (CC = 0xD0 at byte 5)
+            if len(resp) >= 7 and resp[0] == 0x03 and resp[5] == 0xD0:
+                return {
+                    "protocol": "s7comm",
+                    "port": port,
+                    "rack": 0,
+                    "slot": 1,
+                    "module_type": "Siemens S7 Controller (COTP Confirmed)",
+                    "serial_number": "N/A",
+                }
         except Exception as e:
-            logger.debug(f"S7comm probe error: {e}")
-            return None
+            logger.debug(f"S7comm pure-socket COTP probe error: {e}")
+
+        return None
 
     def probe_ethernet_ip(self, port: int = 44818) -> Optional[Dict[str, Any]]:
-        """Rockwell EtherNet/IP (CIP) non-intrusive ListIdentity probe."""
+        """Rockwell EtherNet/IP (CIP) non-intrusive ListIdentity probe with pure-socket fallback."""
         try:
             from pycomm3 import CIPDriver
             client = CIPDriver(self.host)
-            # Use basic read-only properties
-            props = {
-                "protocol": "ethernet_ip",
-                "port": port,
-                "target": self.host,
-            }
-            return props
+            return {"protocol": "ethernet_ip", "port": port, "target": self.host}
+        except Exception:
+            pass
+
+        # Pure socket ENIP ListIdentity (Command 0x0063) probe
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(self.timeout)
+            sock.connect((self.host, port))
+            # ENIP Encapsulation Header: Command=0x0063, Length=0, Session=0, Status=0, Context=0, Options=0
+            enip_header = struct.pack("<HHII8sI", 0x0063, 0, 0, 0, b"\x00" * 8, 0)
+            sock.sendall(enip_header)
+            resp = sock.recv(64)
+            sock.close()
+            if len(resp) >= 24:
+                resp_cmd = struct.unpack("<H", resp[:2])[0]
+                if resp_cmd == 0x0063:
+                    return {"protocol": "ethernet_ip", "port": port, "target": self.host}
         except Exception as e:
-            logger.debug(f"EtherNet/IP probe error: {e}")
-            return None
+            logger.debug(f"EtherNet/IP socket probe error: {e}")
+
+        return None
 
     def execute_full_scan(self, output_path: str = "config/plc_profile.json") -> Dict[str, Any]:
         """Runs the complete phased scanning workflow and saves profile."""

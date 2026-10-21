@@ -262,7 +262,10 @@ class _ModbusResponse:
 
 
 class _PureSocketModbusClient:
-    """Zero-dependency pure Python socket implementation of Modbus TCP read client."""
+    """
+    Zero-dependency, hardened pure Python socket implementation of Modbus TCP read client.
+    Physically lacks write framing and enforces strict read-only execution at the wire level.
+    """
 
     def __init__(self, host: str, port: int = 502, timeout: float = 2.0):
         self.host = host
@@ -271,16 +274,26 @@ class _PureSocketModbusClient:
         self.sock: Optional[socket.socket] = None
         self._trans_id = 0
 
+    def __getattr__(self, name: str):
+        lowered = name.lower()
+        if "write" in lowered or "force" in lowered or "stop" in lowered:
+            raise PLCWriteAttemptBlockedError(
+                f"FATAL SAFETY INTERCEPTION: Method '{name}' is strictly prohibited on live production equipment! "
+                f"Blocked at driver level."
+            )
+        raise AttributeError(f"'{self.__class__.__name__}' has no attribute '{name}'")
+
     def connect(self) -> bool:
         import socket
         try:
+            self.close()
             self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.sock.settimeout(self.timeout)
             self.sock.connect((self.host, self.port))
             return True
         except Exception as e:
             logger.debug(f"Pure socket connect failed to {self.host}:{self.port}: {e}")
-            self.sock = None
+            self.close()
             return False
 
     def close(self):
@@ -291,54 +304,83 @@ class _PureSocketModbusClient:
                 pass
             self.sock = None
 
-    def read_holding_registers(self, address: int, count: int, slave: int = 1) -> _ModbusResponse:
+    def _recv_exact(self, num_bytes: int) -> bytes:
+        """Reads exact number of bytes from TCP stream to handle MTU fragmentation safely."""
+        if not self.sock:
+            raise ConnectionError("Socket is not connected.")
+        buf = bytearray()
+        while len(buf) < num_bytes:
+            chunk = self.sock.recv(num_bytes - len(buf))
+            if not chunk:
+                raise ConnectionResetError("Socket connection closed prematurely by PLC.")
+            buf.extend(chunk)
+        return bytes(buf)
+
+    def _execute_read_query(self, func_code: int, address: int, count: int, slave: int = 1) -> _ModbusResponse:
+        """Executes a strictly read-only Modbus request with wire-level assertion."""
+        # WIRE-LEVEL HARD-LOCK: Prevent any write function code from ever being assembled
+        if func_code not in (0x01, 0x02, 0x03, 0x04):
+            raise PLCWriteAttemptBlockedError(
+                f"EGRESS FIREWALL BLOCK: Function code 0x{func_code:02X} is strictly prohibited!"
+            )
+
         import struct
         if not self.sock:
             if not self.connect():
                 return _ModbusResponse(error=True)
 
         self._trans_id = (self._trans_id + 1) & 0xFFFF
-        # MBAP: TransID(2), ProtoID(2)=0, Length(2)=6, UnitID(1), FuncCode(1)=0x03, Start(2), Count(2)
-        pdu = struct.pack(">HHHBBHH", self._trans_id, 0, 6, slave, 0x03, address, count)
+        pdu = struct.pack(">HHHBBHH", self._trans_id, 0, 6, slave, func_code, address, count)
+
         try:
             self.sock.sendall(pdu)
-            header = self.sock.recv(7)
-            if len(header) < 7:
-                return _ModbusResponse(error=True)
+            header = self._recv_exact(7)
             r_tid, r_pid, r_len, r_uid = struct.unpack(">HHHB", header)
-            body = self.sock.recv(r_len - 1)
-            if len(body) < 2 or body[0] != 0x03:
+
+            if r_len < 2:
                 return _ModbusResponse(error=True)
+
+            body = self._recv_exact(r_len - 1)
+            resp_func = body[0]
+
+            # Check for Modbus Exception Response (High bit set: func_code | 0x80)
+            if resp_func == (func_code | 0x80):
+                ex_code = body[1] if len(body) > 1 else 0
+                logger.warning(f"Modbus Exception 0x{ex_code:02X} from PLC for function 0x{func_code:02X} at address {address}")
+                return _ModbusResponse(error=True)
+
+            if resp_func != func_code:
+                return _ModbusResponse(error=True)
+
             byte_count = body[1]
-            reg_bytes = body[2 : 2 + byte_count]
-            regs = [struct.unpack(">H", reg_bytes[i : i + 2])[0] for i in range(0, len(reg_bytes), 2)]
-            return _ModbusResponse(registers=regs, error=False)
+            data_payload = body[2 : 2 + byte_count]
+
+            if func_code in (0x03, 0x04):
+                regs = [struct.unpack(">H", data_payload[i : i + 2])[0] for i in range(0, len(data_payload) - 1, 2)]
+                return _ModbusResponse(registers=regs, error=False)
+            elif func_code in (0x01, 0x02):
+                # Unpack bits
+                bits = []
+                for b in data_payload:
+                    for bit_idx in range(8):
+                        bits.append(bool((b >> bit_idx) & 0x01))
+                return _ModbusResponse(bits=bits[:count], error=False)
+
+            return _ModbusResponse(error=True)
+
         except Exception as e:
-            logger.debug(f"Pure socket read error: {e}")
+            logger.debug(f"Pure socket read error on {self.host}:{self.port}: {e}")
             self.close()
             return _ModbusResponse(error=True)
+
+    def read_holding_registers(self, address: int, count: int, slave: int = 1) -> _ModbusResponse:
+        return self._execute_read_query(0x03, address, count, slave)
 
     def read_input_registers(self, address: int, count: int, slave: int = 1) -> _ModbusResponse:
-        import struct
-        if not self.sock:
-            if not self.connect():
-                return _ModbusResponse(error=True)
+        return self._execute_read_query(0x04, address, count, slave)
 
-        self._trans_id = (self._trans_id + 1) & 0xFFFF
-        pdu = struct.pack(">HHHBBHH", self._trans_id, 0, 6, slave, 0x04, address, count)
-        try:
-            self.sock.sendall(pdu)
-            header = self.sock.recv(7)
-            if len(header) < 7:
-                return _ModbusResponse(error=True)
-            r_tid, r_pid, r_len, r_uid = struct.unpack(">HHHB", header)
-            body = self.sock.recv(r_len - 1)
-            if len(body) < 2 or body[0] != 0x04:
-                return _ModbusResponse(error=True)
-            byte_count = body[1]
-            reg_bytes = body[2 : 2 + byte_count]
-            regs = [struct.unpack(">H", reg_bytes[i : i + 2])[0] for i in range(0, len(reg_bytes), 2)]
-            return _ModbusResponse(registers=regs, error=False)
-        except Exception:
-            self.close()
-            return _ModbusResponse(error=True)
+    def read_discrete_inputs(self, address: int, count: int, slave: int = 1) -> _ModbusResponse:
+        return self._execute_read_query(0x02, address, count, slave)
+
+    def read_coils(self, address: int, count: int, slave: int = 1) -> _ModbusResponse:
+        return self._execute_read_query(0x01, address, count, slave)
