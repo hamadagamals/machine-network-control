@@ -162,14 +162,23 @@ class AutoDiagnosticsEngine:
         )
 
         live_registers_read = []
+        is_s7 = "Siemens" in diagnostic_result["detected_protocol"] or "s7" in diagnostic_result["detected_protocol"].lower()
+
         try:
             if client.connect():
                 for _ in range(5):
                     t0 = time.perf_counter()
                     try:
-                        regs = client.read_holding_registers(address=0, count=6, unit_id=1)
-                        if not live_registers_read and regs:
-                            live_registers_read = regs
+                        if is_s7:
+                            db_bytes = client.read_s7_db(db_number=1, start=0, size=32)
+                            if not live_registers_read and db_bytes:
+                                import struct
+                                live_registers_read = [struct.unpack(">H", db_bytes[i : i + 2])[0] for i in range(0, len(db_bytes) - 1, 2)]
+                        else:
+                            # Modbus read 0..29 safe batch read
+                            regs = client.read_holding_registers(address=0, count=25, unit_id=1)
+                            if not live_registers_read and regs:
+                                live_registers_read = regs
                         latencies.append((time.perf_counter() - t0) * 1000.0)
                     except Exception:
                         break
@@ -185,62 +194,137 @@ class AutoDiagnosticsEngine:
         # STEP 4: Memory Mapping & Tag Enumeration (70 - 85%)
         # ----------------------------------------------------------------------
         self._emit(75, "جاري فحص مصفوفة العناوين المتاحة والمتغيرات الحية...")
-        tags_discovered = [
-            {
-                "name": "machine_state",
-                "protocol": diagnostic_result["detected_protocol"],
-                "area": "Register 0",
-                "address": "0",
-                "data_type": "UINT16",
-                "tier": "Tier 1 (50ms)",
-                "desc": f"حالة تشغيل الماكينة (القيمة الحالية: {live_registers_read[0] if len(live_registers_read) > 0 else '0'})",
-            },
-            {
-                "name": "cycle_trigger",
-                "protocol": diagnostic_result["detected_protocol"],
-                "area": "Register 1",
-                "address": "1",
-                "data_type": "BOOL",
-                "tier": "Tier 1 (50ms)",
-                "desc": f"مؤشر بدء الدورة (القيمة الحالية: {live_registers_read[1] if len(live_registers_read) > 1 else '0'})",
-            },
-            {
-                "name": "hydraulic_pressure",
-                "protocol": diagnostic_result["detected_protocol"],
-                "area": "Register 2",
-                "address": "2",
-                "data_type": "INT16 (x10)",
-                "tier": "Tier 1 (50ms)",
-                "desc": f"ضغط الهيدروليك (القيمة الحالية: {live_registers_read[2]/10.0 if len(live_registers_read) > 2 else '0.0'} Bar)",
-            },
-            {
-                "name": "motor_current",
-                "protocol": diagnostic_result["detected_protocol"],
-                "area": "Register 3",
-                "address": "3",
-                "data_type": "INT16 (x10)",
-                "tier": "Tier 1 (50ms)",
-                "desc": f"أمبير المحرك الرئيسي (القيمة الحالية: {live_registers_read[3]/10.0 if len(live_registers_read) > 3 else '0.0'} A)",
-            },
-            {
-                "name": "oil_temperature",
-                "protocol": diagnostic_result["detected_protocol"],
-                "area": "Register 20",
-                "address": "20",
-                "data_type": "INT16 (x10)",
-                "tier": "Tier 2 (1s)",
-                "desc": "حرارة زيت الهيدروليك (°C)",
-            },
-            {
-                "name": "shift_counter",
-                "protocol": diagnostic_result["detected_protocol"],
-                "area": "Register 30-31",
-                "address": "30-31",
-                "data_type": "UINT32",
-                "tier": "Tier 3 (10s)",
-                "desc": "إجمالي القطع المكتملة في الوردية",
-            },
-        ]
+        
+        if is_s7:
+            tags_discovered = [
+                {
+                    "name": "machine_state",
+                    "protocol": diagnostic_result["detected_protocol"],
+                    "area": "DB1.DBW0",
+                    "address": "DB1,INT0",
+                    "data_type": "INT16",
+                    "tier": "Tier 1 (50ms)",
+                    "desc": f"حالة تشغيل الماكينة (القيمة الحالية: {live_registers_read[0] if len(live_registers_read) > 0 else '0'})",
+                },
+                {
+                    "name": "cycle_trigger",
+                    "protocol": diagnostic_result["detected_protocol"],
+                    "area": "DB1.DBX2.0",
+                    "address": "DB1,X2.0",
+                    "data_type": "BOOL",
+                    "tier": "Tier 1 (50ms)",
+                    "desc": f"مؤشر بدء الدورة (القيمة الحالية: {live_registers_read[1] if len(live_registers_read) > 1 else '0'})",
+                },
+                {
+                    "name": "hydraulic_pressure",
+                    "protocol": diagnostic_result["detected_protocol"],
+                    "area": "DB1.DBW4",
+                    "address": "DB1,INT4",
+                    "data_type": "INT16 (x10)",
+                    "tier": "Tier 1 (50ms)",
+                    "desc": f"ضغط الهيدروليك (القيمة الحالية: {live_registers_read[2]/10.0 if len(live_registers_read) > 2 else '0.0'} Bar)",
+                },
+                {
+                    "name": "motor_current",
+                    "protocol": diagnostic_result["detected_protocol"],
+                    "area": "DB1.DBW6",
+                    "address": "DB1,INT6",
+                    "data_type": "INT16 (x10)",
+                    "tier": "Tier 1 (50ms)",
+                    "desc": f"أمبير المحرك الرئيسي (القيمة الحالية: {live_registers_read[3]/10.0 if len(live_registers_read) > 3 else '0.0'} A)",
+                },
+                {
+                    "name": "oil_temperature",
+                    "protocol": diagnostic_result["detected_protocol"],
+                    "area": "DB1.DBW20",
+                    "address": "DB1,INT20",
+                    "data_type": "INT16 (x10)",
+                    "tier": "Tier 2 (1s)",
+                    "desc": "حرارة زيت الهيدروليك (°C)",
+                },
+                {
+                    "name": "shift_counter",
+                    "protocol": diagnostic_result["detected_protocol"],
+                    "area": "DB1.DBD24",
+                    "address": "DB1,DINT24",
+                    "data_type": "DINT (32-bit)",
+                    "tier": "Tier 3 (10s)",
+                    "desc": "إجمالي القطع المكتملة في الوردية",
+                },
+            ]
+        else:
+            tags_discovered = [
+                {
+                    "name": "machine_state",
+                    "protocol": diagnostic_result["detected_protocol"],
+                    "area": "Register 0",
+                    "address": "0",
+                    "data_type": "UINT16",
+                    "tier": "Tier 1 (50ms)",
+                    "desc": f"حالة تشغيل الماكينة (القيمة الحالية: {live_registers_read[0] if len(live_registers_read) > 0 else '0'})",
+                },
+                {
+                    "name": "cycle_trigger",
+                    "protocol": diagnostic_result["detected_protocol"],
+                    "area": "Register 1",
+                    "address": "1",
+                    "data_type": "BOOL",
+                    "tier": "Tier 1 (50ms)",
+                    "desc": f"مؤشر بدء الدورة (القيمة الحالية: {live_registers_read[1] if len(live_registers_read) > 1 else '0'})",
+                },
+                {
+                    "name": "hydraulic_pressure",
+                    "protocol": diagnostic_result["detected_protocol"],
+                    "area": "Register 2",
+                    "address": "2",
+                    "data_type": "INT16 (x10)",
+                    "tier": "Tier 1 (50ms)",
+                    "desc": f"ضغط الهيدروليك (القيمة الحالية: {live_registers_read[2]/10.0 if len(live_registers_read) > 2 else '0.0'} Bar)",
+                },
+                {
+                    "name": "motor_current",
+                    "protocol": diagnostic_result["detected_protocol"],
+                    "area": "Register 3",
+                    "address": "3",
+                    "data_type": "INT16 (x10)",
+                    "tier": "Tier 1 (50ms)",
+                    "desc": f"أمبير المحرك الرئيسي (القيمة الحالية: {live_registers_read[3]/10.0 if len(live_registers_read) > 3 else '0.0'} A)",
+                },
+                {
+                    "name": "oil_temperature",
+                    "protocol": diagnostic_result["detected_protocol"],
+                    "area": "Register 20",
+                    "address": "20",
+                    "data_type": "INT16 (x10)",
+                    "tier": "Tier 2 (1s)",
+                    "desc": f"حرارة زيت الهيدروليك (°C) (القيمة الحالية: {live_registers_read[20]/10.0 if len(live_registers_read) > 20 else '0.0'} °C)",
+                },
+                {
+                    "name": "shift_counter",
+                    "protocol": diagnostic_result["detected_protocol"],
+                    "area": "Register 30-31",
+                    "address": "30-31",
+                    "data_type": "UINT32",
+                    "tier": "Tier 3 (10s)",
+                    "desc": "إجمالي القطع المكتملة في الوردية",
+                },
+            ]
+
+        # Scan for any additional responsive non-zero registers discovered in live scan
+        if live_registers_read and len(live_registers_read) > 4:
+            for offset_idx in range(4, min(20, len(live_registers_read))):
+                val = live_registers_read[offset_idx]
+                if val != 0 and offset_idx not in (0, 1, 2, 3):
+                    tags_discovered.append({
+                        "name": f"aux_parameter_r{offset_idx}",
+                        "protocol": diagnostic_result["detected_protocol"],
+                        "area": f"Register {offset_idx}" if not is_s7 else f"DB1.DBW{offset_idx*2}",
+                        "address": str(offset_idx),
+                        "data_type": "UINT16",
+                        "tier": "Tier 2 (1s)",
+                        "desc": f"متغير تشغيلي نشط مكتشف على الماكينة (القيمة الحالية: {val})",
+                    })
+
         diagnostic_result["tags"] = tags_discovered
         diagnostic_result["total_tags_count"] = len(tags_discovered)
 

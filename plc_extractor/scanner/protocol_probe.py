@@ -6,6 +6,7 @@ Performs non-intrusive TCP port scanning and library handshakes to fingerprint t
 import json
 import logging
 import socket
+import struct
 import time
 from typing import Any, Dict, List, Optional
 
