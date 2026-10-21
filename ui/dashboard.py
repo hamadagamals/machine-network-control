@@ -128,6 +128,7 @@ def submit_answers(sub: AnswerSubmission):
         rg = ReportGenerator()
         res["excel_report_path"] = rg.generate_excel_report(res)
         res["markdown_report_path"] = rg.generate_markdown_report(res)
+        res["json_config_path"] = rg.generate_tags_config_json(res)
     return {"status": "UPDATED", "answers": diagnostic_state["user_answers"]}
 
 
@@ -153,6 +154,26 @@ def download_markdown():
             media_type="text/markdown",
         )
     raise HTTPException(status_code=404, detail="No Markdown report available yet. Run audit first.")
+
+
+@app.get("/api/reports/download/config")
+def download_config():
+    res = diagnostic_state.get("result")
+    if res and res.get("json_config_path") and os.path.exists(res["json_config_path"]):
+        return FileResponse(
+            res["json_config_path"],
+            filename=os.path.basename(res["json_config_path"]),
+            media_type="application/json",
+        )
+    fallback = os.path.join("config", "active_tags_config.json")
+    if os.path.exists(fallback):
+        return FileResponse(
+            fallback,
+            filename="active_tags_config.json",
+            media_type="application/json",
+        )
+    raise HTTPException(status_code=404, detail="No Tags config available yet. Run audit first.")
+
 
 
 @app.post("/api/simulator/toggle")
@@ -498,12 +519,15 @@ HTML_CONTENT = """
                     <h3 style="color: var(--accent-cyan); font-size: 16px;">✓ تم اكتمال الفحص وتوليد التقرير الهندسي الشامل</h3>
                     <p style="font-size: 13px; color: var(--text-muted); margin-top: 4px;">تم فحص المعالج وتحديد العناوين وسرعة الاستجابة بدقة. قم بتحميل التقرير فوراً:</p>
                 </div>
-                <div style="display: flex; gap: 10px;">
+                <div style="display: flex; gap: 10px; flex-wrap: wrap;">
                     <a href="/api/reports/download/excel" class="btn btn-primary" download>
                         <span>📥</span> تحميل تقرير Excel مفصل (.xlsx)
                     </a>
                     <a href="/api/reports/download/markdown" class="btn btn-secondary" download>
                         <span>📄</span> تحميل تقرير Text / Markdown (.md)
+                    </a>
+                    <a href="/api/reports/download/config" class="btn btn-success" download>
+                        <span>⚙️</span> تحميل ملف الإعدادات (tags_config.json)
                     </a>
                 </div>
             </div>

@@ -238,3 +238,50 @@ class ReportGenerator:
 
         logger.info(f"Markdown Integration Report generated successfully: {filepath}")
         return filepath
+
+    def generate_tags_config_json(self, diagnostic_data: Dict[str, Any]) -> str:
+        """
+        Generates a production-ready, machine-readable JSON configuration file
+        that can be fed directly to the Polling Engine and SCADA connectors.
+        """
+        import json
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        station_name = diagnostic_data.get("station_name", "Machine-01")
+        filename = f"tags_config_{station_name}_{timestamp}.json"
+        filepath = os.path.join(self.output_dir, filename)
+
+        tags_raw = diagnostic_data.get("tags", [])
+        structured_config = {
+            "version": "1.0",
+            "station_name": station_name,
+            "target_ip": diagnostic_data.get("target_ip", "127.0.0.1"),
+            "port": diagnostic_data.get("port", 502),
+            "protocol": diagnostic_data.get("detected_protocol", "Modbus TCP"),
+            "safety_profile": "STRICT_READ_ONLY",
+            "intervals_ms": {
+                "tier_1_high_speed": 50,
+                "tier_2_process": 1000,
+                "tier_3_diagnostics": 10000,
+            },
+            "memory_map": {
+                "tags": tags_raw,
+                "total_tags": len(tags_raw),
+            },
+            "poller_ready": True,
+            "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+
+        # Write timestamped copy in data/reports
+        with open(filepath, "w", encoding="utf-8") as f:
+            json.dump(structured_config, f, indent=2, ensure_ascii=False)
+
+        # Also write / update current active config in config/active_tags_config.json
+        active_config_dir = "config"
+        os.makedirs(active_config_dir, exist_ok=True)
+        active_filepath = os.path.join(active_config_dir, "active_tags_config.json")
+        with open(active_filepath, "w", encoding="utf-8") as f:
+            json.dump(structured_config, f, indent=2, ensure_ascii=False)
+
+        logger.info(f"Production Tags JSON Config generated: {filepath} and {active_filepath}")
+        return filepath
+

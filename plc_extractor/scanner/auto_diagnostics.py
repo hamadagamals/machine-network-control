@@ -275,12 +275,14 @@ class AutoDiagnosticsEngine:
 
         diagnostic_result["missing_info_questions"] = questions
 
-        # Generate Reports
+        # Generate Reports & Ready-to-Run Config
         excel_path = self.report_gen.generate_excel_report(diagnostic_result)
         md_path = self.report_gen.generate_markdown_report(diagnostic_result)
+        json_config_path = self.report_gen.generate_tags_config_json(diagnostic_result)
 
         diagnostic_result["excel_report_path"] = excel_path
         diagnostic_result["markdown_report_path"] = md_path
+        diagnostic_result["json_config_path"] = json_config_path
         diagnostic_result["status"] = "COMPLETED"
 
         self._emit(100, "اكتمل الفحص الآلي للماكينة بنجاح! تم استخراج التقارير وتجهيز خريطة الربط.", diagnostic_result)
