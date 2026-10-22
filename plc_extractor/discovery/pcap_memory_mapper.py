@@ -77,14 +77,14 @@ class PCAPMemoryMapper:
         if not is_request or len(payload) < 12:
             return
         try:
-            # Modbus TCP Header: TransactionID(2), ProtocolID(2), Length(2), UnitID(1), FuncCode(1)
-            trans_id, proto_id, length, unit_id, func_code = struct.unpack(">HHHBB", payload[:7])
+            # Modbus TCP Header: TransactionID(2), ProtocolID(2), Length(2), UnitID(1), FuncCode(1) = 8 bytes
+            trans_id, proto_id, length, unit_id, func_code = struct.unpack(">HHHBB", payload[:8])
             if proto_id != 0:
                 return  # Not Modbus protocol
 
             # Only track read function codes (0x01, 0x02, 0x03, 0x04)
             if func_code in (0x01, 0x02, 0x03, 0x04):
-                start_addr, count = struct.unpack(">HH", payload[7:11])
+                start_addr, count = struct.unpack(">HH", payload[8:12])
                 reg_type = {
                     0x01: "coil",
                     0x02: "discrete_input",
@@ -109,31 +109,31 @@ class PCAPMemoryMapper:
 
     def _dissect_s7comm(self, payload: bytes, timestamp: float, is_request: bool):
         """Dissects Siemens S7comm Read Var requests."""
-        if len(payload) < 10:
+        if len(payload) < 14:
             return
         try:
             # Check for TPKT (0x03 0x00) and COTP
             if payload[0] == 0x03 and payload[1] == 0x00:
                 cotp_len = payload[4]
                 s7_offset = 4 + 1 + cotp_len
-                if len(payload) > s7_offset + 10:
+                # S7 header is 10 bytes; function code is at s7_offset + 10
+                if len(payload) >= s7_offset + 12:
                     protocol_id = payload[s7_offset]
                     if protocol_id == 0x32:  # S7comm magic byte
                         rosctr = payload[s7_offset + 1]
                         # ROSCTR 1 = Job (Request)
                         if rosctr == 0x01:
-                            func = payload[s7_offset + 9] if len(payload) > s7_offset + 9 else 0
+                            func = payload[s7_offset + 10]
                             if func == 0x04:  # Read Var
-                                # Parse items in S7 request
-                                item_count = payload[s7_offset + 10]
-                                curr = s7_offset + 11
+                                item_count = payload[s7_offset + 11]
+                                curr = s7_offset + 12
                                 for _ in range(item_count):
                                     if curr + 12 > len(payload):
                                         break
                                     # Variable specification: 0x12 (VarSpec), Length, SyntaxID, Area, DB Number, Address
-                                    area = payload[curr + 5]
                                     db_num = struct.unpack(">H", payload[curr + 6 : curr + 8])[0]
-                                    addr_bytes = payload[curr + 8 : curr + 11]
+                                    area = payload[curr + 8]
+                                    addr_bytes = payload[curr + 9 : curr + 12]
                                     addr_int = (addr_bytes[0] << 16) | (addr_bytes[1] << 8) | addr_bytes[2]
                                     byte_offset = addr_int >> 3
                                     bit_offset = addr_int & 0x07
@@ -179,8 +179,69 @@ class PCAPMemoryMapper:
             logger.debug(f"ENIP dissection error: {e}")
 
     def _fallback_raw_parse(self):
-        """Minimal fallback parser for standard pcap file header."""
-        logger.info("Executed fallback PCAP byte stream analysis.")
+        """Pure-Python libpcap binary parser for standard .pcap captures without Scapy dependency."""
+        logger.info(f"Initiating pure Python libpcap binary dissection of {self.pcap_path}...")
+        try:
+            with open(self.pcap_path, "rb") as f:
+                global_hdr = f.read(24)
+                if len(global_hdr) < 24:
+                    return
+
+                magic = global_hdr[:4]
+                if magic == b"\xd4\xc3\xb2\xa1":
+                    endian = "<"
+                elif magic == b"\xa1\xb2\xc3\xd4":
+                    endian = ">"
+                else:
+                    logger.debug("Unsupported or non-standard pcap magic bytes.")
+                    return
+
+                network = struct.unpack(f"{endian}I", global_hdr[20:24])[0]
+                # Network 1 = Ethernet
+                if network != 1:
+                    return
+
+                while True:
+                    pkt_hdr = f.read(16)
+                    if len(pkt_hdr) < 16:
+                        break
+                    ts_sec, ts_usec, caplen, origlen = struct.unpack(f"{endian}IIII", pkt_hdr)
+                    timestamp = float(ts_sec) + (float(ts_usec) / 1000000.0)
+
+                    pkt_data = f.read(caplen)
+                    if len(pkt_data) < 14:
+                        continue
+
+                    # Ethernet Header (14 bytes)
+                    eth_type = struct.unpack(">H", pkt_data[12:14])[0]
+                    if eth_type != 0x0800:  # IPv4
+                        continue
+
+                    ip_data = pkt_data[14:]
+                    if len(ip_data) < 20:
+                        continue
+
+                    ip_ihl = (ip_data[0] & 0x0F) * 4
+                    ip_proto = ip_data[9]
+                    if ip_proto != 6:  # TCP
+                        continue
+
+                    tcp_data = ip_data[ip_ihl:]
+                    if len(tcp_data) < 20:
+                        continue
+
+                    sport, dport = struct.unpack(">HH", tcp_data[:4])
+                    tcp_offset = ((tcp_data[12] >> 4) & 0x0F) * 4
+                    payload = tcp_data[tcp_offset:]
+
+                    if dport == 502 or sport == 502:
+                        self._dissect_modbus(payload, timestamp, is_request=(dport == 502))
+                    elif dport == 102 or sport == 102:
+                        self._dissect_s7comm(payload, timestamp, is_request=(dport == 102))
+                    elif dport == 44818 or sport == 44818:
+                        self._dissect_enip(payload, timestamp, is_request=(dport == 44818))
+        except Exception as e:
+            logger.warning(f"Fallback raw pcap parsing error: {e}")
 
     def _build_memory_map(self) -> Dict[str, Any]:
         """Calculates polling frequencies and builds candidate memory map."""

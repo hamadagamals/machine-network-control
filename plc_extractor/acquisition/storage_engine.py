@@ -100,24 +100,31 @@ class StorageEngine:
 
             self._total_records_saved += len(df)
 
-            # 1. Append to DuckDB
+            # 1. Append to DuckDB with column-name matching
             try:
                 import duckdb
                 con = duckdb.connect(self.db_path)
                 con.execute("CREATE TABLE IF NOT EXISTS telemetry AS SELECT * FROM df WHERE 1=0;")
                 con.register("temp_df", df)
-                con.execute("INSERT INTO telemetry SELECT * FROM temp_df;")
+                try:
+                    con.execute("INSERT INTO telemetry BY NAME SELECT * FROM temp_df;")
+                except Exception:
+                    con.execute("INSERT INTO telemetry SELECT * FROM temp_df;")
                 con.close()
-            except ImportError:
+            except Exception as e:
                 # Fallback to appending to CSV
+                logger.debug(f"DuckDB append fallback to CSV: {e}")
                 csv_path = self.db_path.replace(".duckdb", ".csv")
                 df.to_csv(csv_path, mode="a", index=False, header=not os.path.exists(csv_path))
 
-            # 2. Export partitioned Parquet hourly
+            # 2. Export partitioned Parquet chunks without destructive overwriting
             hour_str = time.strftime("%Y%m%d_%H")
-            parquet_file = os.path.join(self.parquet_dir, f"telemetry_{hour_str}.parquet")
+            hour_dir = os.path.join(self.parquet_dir, f"hour={hour_str}")
+            os.makedirs(hour_dir, exist_ok=True)
+            chunk_file = os.path.join(hour_dir, f"chunk_{int(time.time() * 1000)}.parquet")
+
             try:
-                df.to_parquet(parquet_file, engine="pyarrow", index=False)
+                df.to_parquet(chunk_file, engine="pyarrow", index=False)
             except Exception as e:
                 logger.debug(f"Parquet export skipped: {e}")
 

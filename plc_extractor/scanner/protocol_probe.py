@@ -49,38 +49,37 @@ class ProtocolProbe:
         return results
 
     def probe_modbus(self, port: int = 502) -> Optional[Dict[str, Any]]:
-        """Non-intrusive Modbus probe with pure-socket fallback."""
+        """Non-intrusive Modbus probe testing candidate Unit IDs."""
         try:
-            from pymodbus.client import ModbusTcpClient
-            client = ModbusTcpClient(self.host, port=port, timeout=self.timeout)
-            if client.connect():
-                info = {"protocol": "modbus_tcp", "port": port, "responsive_unit_ids": []}
-                for uid in range(1, 6):
-                    resp = client.read_holding_registers(address=0, count=1, slave=uid)
-                    if not resp.isError():
-                        info["responsive_unit_ids"].append(uid)
-                client.close()
-                return info
-        except Exception:
-            pass
+            from plc_extractor.client.modbus_tcp import ReadOnlyModbusTCP, ModbusExceptionResponse
+            client = ReadOnlyModbusTCP(self.host, port=port, timeout=self.timeout)
+            if not client.connect():
+                return None
 
-        # Zero-dependency pure socket fallback probe
-        try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(self.timeout)
-            sock.connect((self.host, port))
-            # Send standard read-only Modbus FC 0x03 probe (TransID 1, Proto 0, Len 6, Unit 1, FC 0x03, Addr 0, Count 1)
-            pdu = struct.pack(">HHHBBHH", 1, 0, 6, 1, 0x03, 0, 1)
-            sock.sendall(pdu)
-            resp = sock.recv(12)
-            sock.close()
-            if len(resp) >= 8:
-                # Any Modbus response (FC 0x03 or Exception 0x83) confirms active Modbus service
-                fc = resp[7]
-                if fc in (0x03, 0x83):
-                    return {"protocol": "modbus_tcp", "port": port, "responsive_unit_ids": [1]}
+            responsive_uids = []
+            candidate_uids = [1, 0, 255, 2, 3, 4, 5]
+            try:
+                for uid in candidate_uids:
+                    try:
+                        regs = client.read_holding_registers(address=0, count=1, unit_id=uid)
+                        responsive_uids.append(uid)
+                    except ModbusExceptionResponse as ex:
+                        if ex.exception_code != 0x0B:
+                            responsive_uids.append(uid)
+                    except Exception:
+                        break
+            finally:
+                client.close()
+
+            if responsive_uids:
+                return {
+                    "protocol": "modbus_tcp",
+                    "port": port,
+                    "responsive_unit_ids": responsive_uids,
+                    "primary_unit_id": responsive_uids[0],
+                }
         except Exception as e:
-            logger.debug(f"Modbus pure-socket probe error on {self.host}:{port}: {e}")
+            logger.debug(f"Modbus probe error on {self.host}:{port}: {e}")
 
         return None
 

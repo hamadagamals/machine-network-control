@@ -29,6 +29,8 @@ class TieredPoller:
         tier1_interval_ms: int = 50,
         tier2_interval_ms: int = 1000,
         tier3_interval_ms: int = 10000,
+        unit_id: int = 1,
+        tags_config: Optional[Dict[str, Any]] = None,
         telemetry_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
     ):
         self.client = client
@@ -36,6 +38,8 @@ class TieredPoller:
         self.t1_interval = max(0.01, tier1_interval_ms / 1000.0)
         self.t2_interval = max(0.1, tier2_interval_ms / 1000.0)
         self.t3_interval = max(1.0, tier3_interval_ms / 1000.0)
+        self.unit_id = unit_id
+        self.tags_config = tags_config or {}
         self.callback = telemetry_callback
 
         self._running = False
@@ -45,6 +49,10 @@ class TieredPoller:
             "avg_latency_ms": 0.0,
             "overruns": 0,
         }
+
+    @staticmethod
+    def _to_int16(val: int) -> int:
+        return val - 65536 if val > 32767 else val
 
     def start(self):
         """Starts the high-frequency polling engine."""
@@ -57,7 +65,7 @@ class TieredPoller:
         self._thread.start()
         logger.info(
             f"Poller started. T1: {self.t1_interval*1000:.1f}ms, "
-            f"T2: {self.t2_interval*1000:.1f}ms, T3: {self.t3_interval*1000:.1f}ms"
+            f"T2: {self.t2_interval*1000:.1f}ms, T3: {self.t3_interval*1000:.1f}ms, Unit ID: {self.unit_id}"
         )
 
     def stop(self):
@@ -69,6 +77,9 @@ class TieredPoller:
 
     def _run_loop(self):
         """Precision drift-compensated polling loop."""
+        import struct
+        from plc_extractor.client.modbus_tcp import ModbusExceptionResponse, ModbusCommunicationError
+
         next_tick = time.perf_counter()
         last_t2 = 0.0
         last_t3 = 0.0
@@ -92,18 +103,29 @@ class TieredPoller:
                 # --------------------------------------------------------------
                 if self.client.protocol == "modbus_tcp":
                     # Batch read holding registers 0 to 19 (Single PDU)
-                    regs = self.client.read_holding_registers(address=0, count=20, unit_id=1)
+                    regs = self.client.read_holding_registers(address=0, count=20, unit_id=self.unit_id)
                     record.update({
                         "machine_state": regs[0],
                         "cycle_trigger": regs[1],
-                        "hydraulic_pressure_bar": regs[2] / 10.0,
-                        "motor_current_amps": regs[3] / 10.0,
+                        "hydraulic_pressure_bar": round(self._to_int16(regs[2]) / 10.0, 2),
+                        "motor_current_amps": round(self._to_int16(regs[3]) / 10.0, 2),
                         "position_encoder": (regs[4] << 16) | regs[5],
                     })
                 elif self.client.protocol == "s7comm":
                     # Batch read DB1 bytes 0 to 32
                     db_bytes = self.client.read_s7_db(db_number=1, start=0, size=32)
                     record["raw_db1_len"] = len(db_bytes)
+                    if len(db_bytes) >= 8:
+                        state_val = struct.unpack(">h", db_bytes[0:2])[0]
+                        trig_val = 1 if (db_bytes[2] & 0x01) else 0
+                        press_val = struct.unpack(">h", db_bytes[4:6])[0] / 10.0
+                        curr_val = struct.unpack(">h", db_bytes[6:8])[0] / 10.0
+                        record.update({
+                            "machine_state": state_val,
+                            "cycle_trigger": trig_val,
+                            "hydraulic_pressure_bar": round(press_val, 2),
+                            "motor_current_amps": round(curr_val, 2),
+                        })
                 else:
                     record["heartbeat"] = 1
 
@@ -112,11 +134,14 @@ class TieredPoller:
                 # --------------------------------------------------------------
                 if (now_perf - last_t2) >= self.t2_interval:
                     if self.client.protocol == "modbus_tcp":
-                        t2_regs = self.client.read_holding_registers(address=20, count=5, unit_id=1)
+                        t2_regs = self.client.read_holding_registers(address=20, count=5, unit_id=self.unit_id)
                         record.update({
-                            "oil_temperature_c": t2_regs[0] / 10.0,
-                            "tank_level_percent": t2_regs[1] / 10.0,
+                            "oil_temperature_c": round(self._to_int16(t2_regs[0]) / 10.0, 1),
+                            "tank_level_percent": round(t2_regs[1] / 10.0, 1),
                         })
+                    elif self.client.protocol == "s7comm" and "raw_db1_len" in record and record["raw_db1_len"] >= 22:
+                        temp_val = struct.unpack(">h", db_bytes[20:22])[0] / 10.0
+                        record["oil_temperature_c"] = round(temp_val, 1)
                     last_t2 = now_perf
 
                 # --------------------------------------------------------------
@@ -124,11 +149,14 @@ class TieredPoller:
                 # --------------------------------------------------------------
                 if (now_perf - last_t3) >= self.t3_interval:
                     if self.client.protocol == "modbus_tcp":
-                        t3_regs = self.client.read_holding_registers(address=30, count=5, unit_id=1)
+                        t3_regs = self.client.read_holding_registers(address=30, count=5, unit_id=self.unit_id)
                         record.update({
                             "shift_part_counter": (t3_regs[0] << 16) | t3_regs[1],
                             "active_recipe_id": t3_regs[2],
                         })
+                    elif self.client.protocol == "s7comm" and "raw_db1_len" in record and record["raw_db1_len"] >= 28:
+                        counter_val = struct.unpack(">i", db_bytes[24:28])[0]
+                        record["shift_part_counter"] = counter_val
                     last_t3 = now_perf
 
                 # Calculate latency
@@ -152,8 +180,13 @@ class TieredPoller:
                 self._metrics["poll_cycles"] += 1
                 self._metrics["avg_latency_ms"] = round(sum(latencies) / len(latencies), 2)
 
+            except ModbusExceptionResponse as e:
+                # Modbus logical exception (e.g. Illegal Data Address): PLC socket is ALIVE and healthy.
+                # Do NOT drop/reconnect socket to avoid exhausting PLC socket pool.
+                logger.debug(f"Modbus logical exception received from PLC: {e}")
             except Exception as e:
-                logger.warning(f"Polling cycle interrupted: {e}. Attempting safe reconnection in 1.0s...")
+                # Transport / socket connection breakdown
+                logger.warning(f"Polling socket error: {e}. Attempting safe reconnection in 1.0s...")
                 time.sleep(1.0)
                 try:
                     self.client.disconnect()

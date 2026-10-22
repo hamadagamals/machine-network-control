@@ -1,0 +1,74 @@
+{
+  "version": "1.0",
+  "station_name": "Machine-01",
+  "target_ip": "127.0.0.1",
+  "port": 502,
+  "protocol": "Unknown",
+  "safety_profile": "STRICT_READ_ONLY",
+  "intervals_ms": {
+    "tier_1_high_speed": 50,
+    "tier_2_process": 1000,
+    "tier_3_diagnostics": 10000
+  },
+  "memory_map": {
+    "tags": [
+      {
+        "name": "machine_state",
+        "protocol": "Unknown",
+        "area": "Register 0",
+        "address": "0",
+        "data_type": "UINT16",
+        "tier": "Tier 1 (50ms)",
+        "desc": "حالة تشغيل الماكينة (القيمة الحالية: 0)"
+      },
+      {
+        "name": "cycle_trigger",
+        "protocol": "Unknown",
+        "area": "Register 1",
+        "address": "1",
+        "data_type": "BOOL",
+        "tier": "Tier 1 (50ms)",
+        "desc": "مؤشر بدء الدورة (القيمة الحالية: 0)"
+      },
+      {
+        "name": "hydraulic_pressure",
+        "protocol": "Unknown",
+        "area": "Register 2",
+        "address": "2",
+        "data_type": "INT16 (x10)",
+        "tier": "Tier 1 (50ms)",
+        "desc": "ضغط الهيدروليك (القيمة الحالية: 0.0 Bar)"
+      },
+      {
+        "name": "motor_current",
+        "protocol": "Unknown",
+        "area": "Register 3",
+        "address": "3",
+        "data_type": "INT16 (x10)",
+        "tier": "Tier 1 (50ms)",
+        "desc": "أمبير المحرك الرئيسي (القيمة الحالية: 0.0 A)"
+      },
+      {
+        "name": "oil_temperature",
+        "protocol": "Unknown",
+        "area": "Register 20",
+        "address": "20",
+        "data_type": "INT16 (x10)",
+        "tier": "Tier 2 (1s)",
+        "desc": "حرارة زيت الهيدروليك (°C)"
+      },
+      {
+        "name": "shift_counter",
+        "protocol": "Unknown",
+        "area": "Register 30-31",
+        "address": "30-31",
+        "data_type": "UINT32",
+        "tier": "Tier 3 (10s)",
+        "desc": "إجمالي القطع المكتملة في الوردية"
+      }
+    ],
+    "total_tags": 6
+  },
+  "poller_ready": true,
+  "generated_at": "2026-10-21 15:42:48"
+}

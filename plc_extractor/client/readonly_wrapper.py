@@ -1,79 +1,54 @@
 """
-STRICTLY READ-ONLY PLC CLIENT WRAPPER (ZERO WRITE CAPABILITY)
-Enforces a hardware and software level read-only abstraction.
-Blocks all write, force, download, delete, or CPU state-change commands at runtime.
+STRICTLY READ-ONLY PLC CLIENT (ZERO WRITE CAPABILITY)
+
+Design (hardened after self-audit):
+  1. NO generic proxy. The previous version forwarded any unknown attribute to the
+     underlying library (pymodbus/snap7/pycomm3), which leaked execute(), generic_message(),
+     diag_restart_communication(), set_plc_datetime() ... That proxy is gone.
+  2. The underlying driver is held in a private slot and is never returned to callers.
+  3. Only explicitly whitelisted READ methods exist on this class.
+  4. Modbus uses our own driver (modbus_tcp.py) whose wire frame is re-checked before send.
+  5. Unknown / unsupported protocols FAIL to connect (no fake "connected" state).
 """
 
 import logging
 import time
 from typing import Any, Dict, List, Optional, Union
+
 from plc_extractor.client.rate_limiter import PLCRateLimiter
+from plc_extractor.client.safety import PLCWriteAttemptBlockedError, is_forbidden_name
+from plc_extractor.client.modbus_tcp import (
+    ReadOnlyModbusTCP,
+    ModbusExceptionResponse,
+    ModbusCommunicationError,
+)
 
 logger = logging.getLogger("PLCReadOnlyClient")
 
-# ==============================================================================
-# PROHIBITED METHODS DICTIONARY (ZERO TOLERANCE)
-# ==============================================================================
-STRICTLY_PROHIBITED_METHODS = {
-    # Modbus Prohibited
-    "write_coil",
-    "write_coils",
-    "write_register",
-    "write_registers",
-    "mask_write_register",
-    "readwrite_registers",
-    # Siemens S7 Prohibited (python-snap7)
-    "db_write",
-    "eb_write",
-    "ab_write",
-    "mb_write",
-    "write_area",
-    "write_multi_vars",
-    "write_tag",
-    "force_bit",
-    "download",
-    "delete",
-    "plc_stop",
-    "plc_cold_start",
-    "plc_hot_start",
-    "compress",
-    "copy_ram_to_rom",
-    # Rockwell CIP / EtherNet/IP Prohibited (pycomm3 / pylogix)
-    "write",
-    "write_tag",
-    "write_tag_fragmented",
-    "set_plc_time",
-    "setplctime",
-    "set_attribute_single",
-    "set_attribute_list",
-    "reset",
-    # OPC UA Prohibited
-    "write_value",
-    "write_attribute_value",
-    "set_value",
-    "call_method",
-}
+SUPPORTED_PROTOCOLS = ("modbus_tcp", "s7comm", "ethernet_ip", "opcua")
 
-# Permitted Modbus Function Codes (Strict Whitelist)
-PERMITTED_MODBUS_FUNCTION_CODES = {
-    0x01: "Read Coils",
-    0x02: "Read Discrete Inputs",
-    0x03: "Read Holding Registers",
-    0x04: "Read Input Registers",
-    0x2B: "Read Device Identification",
-}
+# Backwards compatibility alias
+_PureSocketModbusClient = ReadOnlyModbusTCP
 
-
-class PLCWriteAttemptBlockedError(PermissionError):
-    """Raised immediately when an operation attempts to mutate PLC memory or state."""
-    pass
+__all__ = [
+    "ReadOnlyPLCClient",
+    "ReadOnlyModbusTCP",
+    "_PureSocketModbusClient",
+    "PLCWriteAttemptBlockedError",
+    "ModbusExceptionResponse",
+    "ModbusCommunicationError",
+    "SUPPORTED_PROTOCOLS",
+]
 
 
 class ReadOnlyPLCClient:
-    """
-    Safety wrapper around low-level industrial communication libraries.
-    Ensures that only read-only function codes can ever be executed on the physical controller.
-    """
+    """Safety wrapper exposing read-only operations only."""
+
+    __slots__ = (
+        "protocol", "host", "port", "options", "rate_limiter",
+        "_ReadOnlyPLCClient__driver", "_ReadOnlyPLCClient__connected",
+        "last_error", "_last_exec_time_ms",
+    )
 
     def __init__(
         self,
@@ -83,304 +58,283 @@ class ReadOnlyPLCClient:
         options: Optional[Dict[str, Any]] = None,
         max_requests_per_second: float = 50.0,
     ):
-        self.protocol = protocol.lower().strip()
+        self.protocol = (protocol or "").lower().strip()
         self.host = host
-        self.port = port
-        self.options = options or {}
+        self.port = int(port)
+        self.options = dict(options or {})
         self.rate_limiter = PLCRateLimiter(max_requests_per_second=max_requests_per_second)
-        
-        self._raw_client = None
-        self._is_connected = False
+        self.__driver = None
+        self.__connected = False
+        self.last_error: str = ""
         self._last_exec_time_ms = 0.0
-
         logger.info(
-            f"[SAFETY LOCK ENGAGED] ReadOnlyPLCClient initialized for {self.protocol}://{self.host}:{self.port} "
-            f"(Max Rate: {max_requests_per_second} req/s)"
+            f"[SAFETY LOCK ENGAGED] ReadOnlyPLCClient {self.protocol}://{self.host}:{self.port} "
+            f"(max {max_requests_per_second} req/s)"
         )
 
-    # --------------------------------------------------------------------------
-    # HARD METHOD INTERCEPTION: Blocks any prohibited method access
-    # --------------------------------------------------------------------------
+    # ------------------------------------------------------------------ hard block
     def __getattr__(self, name: str):
-        lowered = name.lower()
-        if lowered in STRICTLY_PROHIBITED_METHODS or "write" in lowered or "force" in lowered or "stop" in lowered:
-            alarm_msg = (
-                f"FATAL SAFETY INTERCEPTION: Method '{name}' is strictly prohibited on live production equipment! "
-                f"Execution blocked before touching network socket."
-            )
-            logger.critical(alarm_msg)
-            raise PLCWriteAttemptBlockedError(alarm_msg)
+        # Only called for attributes that do NOT exist on this class.
+        if is_forbidden_name(name):
+            msg = (f"FATAL SAFETY INTERCEPTION: '{name}' is prohibited on production equipment. "
+                   f"Blocked before any network activity.")
+            logger.critical(msg)
+            raise PLCWriteAttemptBlockedError(msg)
+        raise AttributeError(f"'ReadOnlyPLCClient' has no attribute '{name}' (no pass-through to drivers).")
 
-        if self._raw_client and hasattr(self._raw_client, name):
-            attr = getattr(self._raw_client, name)
-            if callable(attr):
-                def safe_proxy(*args, **kwargs):
-                    self.rate_limiter.acquire()
-                    return attr(*args, **kwargs)
-                return safe_proxy
-            return attr
-
-        raise AttributeError(f"'{self.__class__.__name__}' has no attribute '{name}'")
-
-    # --------------------------------------------------------------------------
-    # PERSISTENT SESSION CONNECTION & RECONNECTION
-    # --------------------------------------------------------------------------
+    # ------------------------------------------------------------------ session
     def connect(self) -> bool:
-        """Establishes a single, persistent session outside the polling loop."""
+        self.disconnect()
+        self.last_error = ""
         try:
             if self.protocol == "modbus_tcp":
-                try:
-                    from pymodbus.client import ModbusTcpClient
-                    self._raw_client = ModbusTcpClient(
-                        host=self.host,
-                        port=self.port,
-                        timeout=self.options.get("timeout", 2.0),
-                    )
-                    self._is_connected = self._raw_client.connect()
-                except ImportError:
-                    logger.info("pymodbus not installed. Using pure-socket native Modbus TCP driver.")
-                    self._raw_client = _PureSocketModbusClient(self.host, self.port, timeout=self.options.get("timeout", 2.0))
-                    self._is_connected = self._raw_client.connect()
+                drv = ReadOnlyModbusTCP(self.host, self.port, timeout=self.options.get("timeout", 2.0))
+                self.__connected = drv.connect()
+                self.__driver = drv
+                if not self.__connected:
+                    self.last_error = f"TCP connection to {self.host}:{self.port} failed."
 
             elif self.protocol == "s7comm":
+                try:
+                    import snap7  # noqa: F401
+                except ImportError:
+                    self.last_error = "DRIVER_MISSING: python-snap7 is not installed (pip install python-snap7)."
+                    return False
                 import snap7
-                self._raw_client = snap7.client.Client()
-                rack = self.options.get("rack", 0)
-                slot = self.options.get("slot", 1)
-                self._raw_client.connect(self.host, rack, slot, self.port)
-                self._is_connected = self._raw_client.get_connected()
+                drv = snap7.client.Client()
+                drv.connect(self.host, int(self.options.get("rack", 0)), int(self.options.get("slot", 1)), self.port)
+                self.__connected = bool(drv.get_connected())
+                self.__driver = drv
 
             elif self.protocol == "ethernet_ip":
-                from pycomm3 import LogixDriver
+                try:
+                    from pycomm3 import LogixDriver
+                except ImportError:
+                    self.last_error = "DRIVER_MISSING: pycomm3 is not installed (pip install pycomm3)."
+                    return False
                 route = self.options.get("route_path")
-                init_str = f"{self.host}/{route}" if route else self.host
-                self._raw_client = LogixDriver(init_str)
-                self._raw_client.open()
-                self._is_connected = self._raw_client.connected
+                path = f"{self.host}/{route}" if route else self.host
+                drv = LogixDriver(path, init_tags=True)
+                drv.open()  # Forward Open + identity + tag list upload (all reads)
+                self.__connected = bool(drv.connected)
+                self.__driver = drv
+
+            elif self.protocol == "opcua":
+                try:
+                    from asyncua.sync import Client as OpcClient
+                except ImportError:
+                    self.last_error = "DRIVER_MISSING: asyncua is not installed (pip install asyncua)."
+                    return False
+                url = self.options.get("url") or f"opc.tcp://{self.host}:{self.port}"
+                drv = OpcClient(url, timeout=self.options.get("timeout", 4))
+                if self.options.get("username"):
+                    drv.set_user(self.options["username"])
+                    drv.set_password(self.options.get("password", ""))
+                drv.connect()
+                self.__connected = True
+                self.__driver = drv
 
             else:
-                logger.warning(f"Protocol '{self.protocol}' connection handler using generic mode.")
-                self._is_connected = True
+                self.last_error = f"UNSUPPORTED_PROTOCOL: '{self.protocol}'."
+                self.__connected = False
 
-            if self._is_connected:
-                logger.info(f"Successfully connected to {self.protocol}://{self.host}:{self.port} in STRICT READ-ONLY mode.")
-            else:
-                logger.error(f"Failed to connect to {self.protocol}://{self.host}:{self.port}")
-            return self._is_connected
+        except Exception as e:  # driver-specific connection failures
+            self.last_error = f"{type(e).__name__}: {e}"
+            self.__connected = False
 
-        except Exception as e:
-            logger.error(f"Connection exception on {self.host}:{self.port}: {e}")
-            self._is_connected = False
-            return False
+        if self.__connected:
+            logger.info(f"Connected (READ-ONLY) to {self.protocol}://{self.host}:{self.port}")
+        else:
+            logger.error(f"Connection failed {self.protocol}://{self.host}:{self.port}: {self.last_error}")
+        return self.__connected
 
     def is_connected(self) -> bool:
-        return self._is_connected
+        if self.protocol == "modbus_tcp" and self.__driver is not None:
+            return self.__driver.connected
+        return self.__connected
 
-    def disconnect(self):
-        """Safely closes the persistent session."""
+    def disconnect(self) -> None:
+        drv = self.__driver
+        self.__driver = None
+        self.__connected = False
+        if drv is None:
+            return
         try:
-            if self._raw_client:
-                if hasattr(self._raw_client, "close"):
-                    self._raw_client.close()
-                elif hasattr(self._raw_client, "disconnect"):
-                    self._raw_client.disconnect()
+            if self.protocol == "modbus_tcp":
+                drv.close()
+            elif self.protocol == "s7comm":
+                drv.disconnect()
+            elif self.protocol == "ethernet_ip":
+                drv.close()
+            elif self.protocol == "opcua":
+                drv.disconnect()
+        except Exception as e:
+            logger.debug(f"Disconnect error: {e}")
+
+    def _require(self, proto: str):
+        if self.protocol != proto:
+            raise TypeError(f"Operation requires protocol '{proto}', client is '{self.protocol}'.")
+        if self.__driver is None:
+            if proto == "modbus_tcp":
+                # Allow lazy reconnect for Modbus only (own driver reconnects safely)
+                self.__driver = ReadOnlyModbusTCP(self.host, self.port, timeout=self.options.get("timeout", 2.0))
+            else:
+                raise ConnectionError("PLC client not connected.")
+        return self.__driver
+
+    def _timed(self, fn, *args):
+        self.rate_limiter.acquire()
+        t0 = time.perf_counter()
+        try:
+            return fn(*args)
         finally:
-            self._is_connected = False
-
-    # --------------------------------------------------------------------------
-    # UNIFIED SAFE READ INTERFACES
-    # --------------------------------------------------------------------------
-    def read_holding_registers(self, address: int, count: int, unit_id: int = 1) -> List[int]:
-        """Modbus Function Code 0x03 (Strictly Read-Only)."""
-        self.rate_limiter.acquire()
-        t0 = time.perf_counter()
-        if not self._raw_client:
-            raise ConnectionError("PLC Client not connected.")
-
-        resp = self._raw_client.read_holding_registers(address=address, count=count, slave=unit_id)
-        self._last_exec_time_ms = (time.perf_counter() - t0) * 1000.0
-
-        if resp.isError():
-            raise IOError(f"Modbus Error reading holding registers at {address}: {resp}")
-        return list(resp.registers)
-
-    def read_input_registers(self, address: int, count: int, unit_id: int = 1) -> List[int]:
-        """Modbus Function Code 0x04 (Strictly Read-Only)."""
-        self.rate_limiter.acquire()
-        t0 = time.perf_counter()
-        resp = self._raw_client.read_input_registers(address=address, count=count, slave=unit_id)
-        self._last_exec_time_ms = (time.perf_counter() - t0) * 1000.0
-
-        if resp.isError():
-            raise IOError(f"Modbus Error reading input registers at {address}: {resp}")
-        return list(resp.registers)
-
-    def read_discrete_inputs(self, address: int, count: int, unit_id: int = 1) -> List[bool]:
-        """Modbus Function Code 0x02 (Strictly Read-Only)."""
-        self.rate_limiter.acquire()
-        resp = self._raw_client.read_discrete_inputs(address=address, count=count, slave=unit_id)
-        if resp.isError():
-            raise IOError(f"Modbus Error reading discrete inputs at {address}: {resp}")
-        return list(resp.bits[:count])
-
-    def read_coils(self, address: int, count: int, unit_id: int = 1) -> List[bool]:
-        """Modbus Function Code 0x01 (Strictly Read-Only)."""
-        self.rate_limiter.acquire()
-        resp = self._raw_client.read_coils(address=address, count=count, slave=unit_id)
-        if resp.isError():
-            raise IOError(f"Modbus Error reading coils at {address}: {resp}")
-        return list(resp.bits[:count])
-
-    def read_s7_db(self, db_number: int, start: int, size: int) -> bytearray:
-        """Siemens S7comm db_read (Strictly Read-Only)."""
-        self.rate_limiter.acquire()
-        t0 = time.perf_counter()
-        data = self._raw_client.db_read(db_number, start, size)
-        self._last_exec_time_ms = (time.perf_counter() - t0) * 1000.0
-        return bytearray(data)
-
-    def read_cip_tags(self, tags: Union[str, List[str]]) -> Any:
-        """Allen-Bradley Logix CIP Multiple Service Packet Read (Strictly Read-Only)."""
-        self.rate_limiter.acquire()
-        t0 = time.perf_counter()
-        res = self._raw_client.read(tags)
-        self._last_exec_time_ms = (time.perf_counter() - t0) * 1000.0
-        return res
+            self._last_exec_time_ms = (time.perf_counter() - t0) * 1000.0
 
     def get_last_exec_time_ms(self) -> float:
         return self._last_exec_time_ms
 
+    # ------------------------------------------------------------------ Modbus (FC 01-04 only)
+    def read_holding_registers(self, address: int, count: int, unit_id: int = 1) -> List[int]:
+        drv = self._require("modbus_tcp")
+        return self._timed(drv.read_holding_registers, address, count, unit_id)
 
-class _ModbusResponse:
-    def __init__(self, registers: Optional[List[int]] = None, bits: Optional[List[bool]] = None, error: bool = False):
-        self.registers = registers or []
-        self.bits = bits or []
-        self._error = error
+    def read_input_registers(self, address: int, count: int, unit_id: int = 1) -> List[int]:
+        drv = self._require("modbus_tcp")
+        return self._timed(drv.read_input_registers, address, count, unit_id)
 
-    def isError(self) -> bool:
-        return self._error
+    def read_coils(self, address: int, count: int, unit_id: int = 1) -> List[bool]:
+        drv = self._require("modbus_tcp")
+        return self._timed(drv.read_coils, address, count, unit_id)
 
+    def read_discrete_inputs(self, address: int, count: int, unit_id: int = 1) -> List[bool]:
+        drv = self._require("modbus_tcp")
+        return self._timed(drv.read_discrete_inputs, address, count, unit_id)
 
-class _PureSocketModbusClient:
-    """
-    Zero-dependency, hardened pure Python socket implementation of Modbus TCP read client.
-    Physically lacks write framing and enforces strict read-only execution at the wire level.
-    """
+    # ------------------------------------------------------------------ Siemens S7 (read services only)
+    def read_s7_db(self, db_number: int, start: int, size: int) -> bytearray:
+        drv = self._require("s7comm")
+        return bytearray(self._timed(drv.db_read, int(db_number), int(start), int(size)))
 
-    def __init__(self, host: str, port: int = 502, timeout: float = 2.0):
-        self.host = host
-        self.port = port
-        self.timeout = timeout
-        self.sock: Optional[socket.socket] = None
-        self._trans_id = 0
-
-    def __getattr__(self, name: str):
-        lowered = name.lower()
-        if "write" in lowered or "force" in lowered or "stop" in lowered:
-            raise PLCWriteAttemptBlockedError(
-                f"FATAL SAFETY INTERCEPTION: Method '{name}' is strictly prohibited on live production equipment! "
-                f"Blocked at driver level."
-            )
-        raise AttributeError(f"'{self.__class__.__name__}' has no attribute '{name}'")
-
-    def connect(self) -> bool:
-        import socket
+    def read_s7_area(self, area: str, db_number: int, start: int, size: int) -> bytearray:
+        """area in {'DB','MK','PE','PA'} -> data blocks, merkers, process inputs, process outputs (READ)."""
+        drv = self._require("s7comm")
         try:
-            self.close()
-            self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.sock.settimeout(self.timeout)
-            self.sock.connect((self.host, self.port))
-            return True
-        except Exception as e:
-            logger.debug(f"Pure socket connect failed to {self.host}:{self.port}: {e}")
-            self.close()
-            return False
+            from snap7.types import Areas  # python-snap7 1.x
+        except ImportError:
+            from snap7.type import Areas   # python-snap7 2.x
+        area_map = {"DB": Areas.DB, "MK": Areas.MK, "PE": Areas.PE, "PA": Areas.PA}
+        if area not in area_map:
+            raise ValueError(f"Unsupported S7 area '{area}'")
+        return bytearray(self._timed(drv.read_area, area_map[area], int(db_number), int(start), int(size)))
 
-    def close(self):
-        if self.sock:
+    def get_s7_identity(self) -> Dict[str, Any]:
+        """SZL reads only (CPU info / order code / run state)."""
+        drv = self._require("s7comm")
+        info: Dict[str, Any] = {}
+        for key, fn in (("cpu_info", drv.get_cpu_info), ("order_code", drv.get_order_code),
+                        ("cpu_state", drv.get_cpu_state), ("pdu_length", drv.get_pdu_length)):
             try:
-                self.sock.close()
+                val = self._timed(fn)
+                if key == "cpu_info":
+                    info["module_type"] = _bstr(getattr(val, "ModuleTypeName", ""))
+                    info["serial_number"] = _bstr(getattr(val, "SerialNumber", ""))
+                    info["module_name"] = _bstr(getattr(val, "ModuleName", ""))
+                    info["as_name"] = _bstr(getattr(val, "ASName", ""))
+                elif key == "order_code":
+                    info["order_code"] = _bstr(getattr(val, "OrderCode", getattr(val, "Code", "")))
+                    v1, v2, v3 = getattr(val, "V1", None), getattr(val, "V2", None), getattr(val, "V3", None)
+                    if v1 is not None:
+                        info["firmware_version"] = f"V{v1}.{v2}.{v3}"
+                else:
+                    info[key] = str(val)
+            except Exception as e:
+                info[f"{key}_error"] = str(e)
+        return info
+
+    def list_s7_blocks(self) -> Dict[str, Any]:
+        drv = self._require("s7comm")
+        blocks = self._timed(drv.list_blocks)
+        return {k: getattr(blocks, k) for k in ("OBCount", "FBCount", "FCCount", "SFBCount", "SFCCount", "DBCount", "SDBCount") if hasattr(blocks, k)}
+
+    # ------------------------------------------------------------------ EtherNet/IP (reads only)
+    def read_cip_tags(self, tags: Union[str, List[str]]) -> Any:
+        drv = self._require("ethernet_ip")
+        return self._timed(drv.read, *([tags] if isinstance(tags, str) else tags))
+
+    def list_cip_tags(self) -> List[Dict[str, Any]]:
+        drv = self._require("ethernet_ip")
+        out = []
+        for name, meta in (getattr(drv, "tags", {}) or {}).items():
+            out.append({
+                "name": name,
+                "data_type": str(meta.get("data_type_name") or meta.get("data_type")),
+                "dimensions": meta.get("dimensions"),
+            })
+        return out
+
+    def get_cip_identity(self) -> Dict[str, Any]:
+        drv = self._require("ethernet_ip")
+        return dict(getattr(drv, "info", {}) or {})
+
+    # ------------------------------------------------------------------ OPC UA (browse + read only)
+    def browse_opcua_variables(self, max_nodes: int = 1500, max_depth: int = 6) -> List[Dict[str, Any]]:
+        drv = self._require("opcua")
+        from asyncua import ua
+        results: List[Dict[str, Any]] = []
+        stack = [(drv.nodes.objects, "Objects", 0)]
+        seen = set()
+        while stack and len(results) < max_nodes:
+            node, path, depth = stack.pop()
+            try:
+                children = self._timed(node.get_children)
             except Exception:
-                pass
-            self.sock = None
+                continue
+            for child in children:
+                nid = child.nodeid.to_string()
+                if nid in seen:
+                    continue
+                seen.add(nid)
+                try:
+                    bname = self._timed(child.read_browse_name).Name
+                    nclass = self._timed(child.read_node_class)
+                except Exception:
+                    continue
+                cpath = f"{path}/{bname}"
+                if nclass == ua.NodeClass.Variable:
+                    entry = {"node_id": nid, "browse_path": cpath}
+                    try:
+                        dv = self._timed(child.read_data_value)
+                        entry["value"] = _jsonable(dv.Value.Value)
+                        entry["data_type"] = dv.Value.VariantType.name
+                    except Exception as e:
+                        entry["read_error"] = str(e)
+                    results.append(entry)
+                if nclass in (ua.NodeClass.Object, ua.NodeClass.Variable) and depth + 1 < max_depth \
+                        and not cpath.startswith("Objects/Server"):
+                    stack.append((child, cpath, depth + 1))
+        return results
 
-    def _recv_exact(self, num_bytes: int) -> bytes:
-        """Reads exact number of bytes from TCP stream to handle MTU fragmentation safely."""
-        if not self.sock:
-            raise ConnectionError("Socket is not connected.")
-        buf = bytearray()
-        while len(buf) < num_bytes:
-            chunk = self.sock.recv(num_bytes - len(buf))
-            if not chunk:
-                raise ConnectionResetError("Socket connection closed prematurely by PLC.")
-            buf.extend(chunk)
-        return bytes(buf)
+    def read_opcua_nodes(self, node_ids: List[str]) -> Dict[str, Any]:
+        drv = self._require("opcua")
+        out = {}
+        for nid in node_ids:
+            try:
+                out[nid] = _jsonable(self._timed(drv.get_node(nid).read_value))
+            except Exception as e:
+                out[nid] = None
+                logger.debug(f"OPC UA read {nid} failed: {e}")
+        return out
 
-    def _execute_read_query(self, func_code: int, address: int, count: int, slave: int = 1) -> _ModbusResponse:
-        """Executes a strictly read-only Modbus request with wire-level assertion."""
-        # WIRE-LEVEL HARD-LOCK: Prevent any write function code from ever being assembled
-        if func_code not in (0x01, 0x02, 0x03, 0x04):
-            raise PLCWriteAttemptBlockedError(
-                f"EGRESS FIREWALL BLOCK: Function code 0x{func_code:02X} is strictly prohibited!"
-            )
 
-        import struct
-        if not self.sock:
-            if not self.connect():
-                return _ModbusResponse(error=True)
+def _bstr(v: Any) -> str:
+    if isinstance(v, (bytes, bytearray)):
+        return v.decode("ascii", errors="ignore").strip("\x00 ").strip()
+    return str(v).strip()
 
-        self._trans_id = (self._trans_id + 1) & 0xFFFF
-        pdu = struct.pack(">HHHBBHH", self._trans_id, 0, 6, slave, func_code, address, count)
 
-        try:
-            self.sock.sendall(pdu)
-            header = self._recv_exact(7)
-            r_tid, r_pid, r_len, r_uid = struct.unpack(">HHHB", header)
-
-            if r_len < 2:
-                return _ModbusResponse(error=True)
-
-            body = self._recv_exact(r_len - 1)
-            resp_func = body[0]
-
-            # Check for Modbus Exception Response (High bit set: func_code | 0x80)
-            if resp_func == (func_code | 0x80):
-                ex_code = body[1] if len(body) > 1 else 0
-                logger.warning(f"Modbus Exception 0x{ex_code:02X} from PLC for function 0x{func_code:02X} at address {address}")
-                return _ModbusResponse(error=True)
-
-            if resp_func != func_code:
-                return _ModbusResponse(error=True)
-
-            byte_count = body[1]
-            data_payload = body[2 : 2 + byte_count]
-
-            if func_code in (0x03, 0x04):
-                regs = [struct.unpack(">H", data_payload[i : i + 2])[0] for i in range(0, len(data_payload) - 1, 2)]
-                return _ModbusResponse(registers=regs, error=False)
-            elif func_code in (0x01, 0x02):
-                # Unpack bits
-                bits = []
-                for b in data_payload:
-                    for bit_idx in range(8):
-                        bits.append(bool((b >> bit_idx) & 0x01))
-                return _ModbusResponse(bits=bits[:count], error=False)
-
-            return _ModbusResponse(error=True)
-
-        except Exception as e:
-            logger.debug(f"Pure socket read error on {self.host}:{self.port}: {e}")
-            self.close()
-            return _ModbusResponse(error=True)
-
-    def read_holding_registers(self, address: int, count: int, slave: int = 1) -> _ModbusResponse:
-        return self._execute_read_query(0x03, address, count, slave)
-
-    def read_input_registers(self, address: int, count: int, slave: int = 1) -> _ModbusResponse:
-        return self._execute_read_query(0x04, address, count, slave)
-
-    def read_discrete_inputs(self, address: int, count: int, slave: int = 1) -> _ModbusResponse:
-        return self._execute_read_query(0x02, address, count, slave)
-
-    def read_coils(self, address: int, count: int, slave: int = 1) -> _ModbusResponse:
-        return self._execute_read_query(0x01, address, count, slave)
+def _jsonable(v: Any) -> Any:
+    if isinstance(v, (int, float, bool, str)) or v is None:
+        return v
+    if isinstance(v, (list, tuple)):
+        return [_jsonable(x) for x in v[:50]]
+    return str(v)

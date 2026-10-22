@@ -39,46 +39,99 @@ class CycleAnalyzer:
         self.current_cycle_id = 0
         self.completed_cycles: List[Dict[str, Any]] = []
 
+        # Stateful streaming tracker
+        self._in_cycle: bool = False
+        self._cycle_start_time: Optional[float] = None
+        self._cycle_records: List[Dict[str, Any]] = []
+        self._last_state: int = self.idle_state
+
+    def reset_state(self):
+        """Resets streaming buffer and state."""
+        self._in_cycle = False
+        self._cycle_start_time = None
+        self._cycle_records.clear()
+        self._last_state = self.idle_state
+
+    def feed_record(self, record: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """
+        Incrementally feeds a single telemetry sample into the stateful analyzer.
+        Returns a cycle KPI dictionary immediately when a cycle completes, or None.
+        Supports both Idle-delimited cycles and continuous auto mode (phase N -> phase 1).
+        """
+        if self.trigger_tag not in record:
+            return None
+
+        curr_state = int(record.get(self.trigger_tag, self.idle_state))
+        t = float(record.get("host_timestamp", time.time()))
+
+        completed_kpi = None
+
+        # Case 1: Continuous auto mode transition (e.g. state 4 -> state 1)
+        if (
+            self._in_cycle
+            and len(self.active_states) > 1
+            and curr_state == self.active_states[0]
+            and self._last_state == self.active_states[-1]
+        ):
+            duration = t - (self._cycle_start_time or t)
+            if duration >= self.min_duration and self._cycle_records:
+                completed_kpi = self._compute_cycle_kpi(
+                    pd.DataFrame(self._cycle_records),
+                    self._cycle_start_time or t,
+                    t,
+                    duration,
+                )
+                self.completed_cycles.append(completed_kpi)
+
+            # Instantly initiate new cycle for the continuous part
+            self._in_cycle = True
+            self._cycle_start_time = t
+            self._cycle_records = [dict(record)]
+            self._last_state = curr_state
+            return completed_kpi
+
+        # Case 2: Idle to Active transition -> Cycle Start
+        if not self._in_cycle and curr_state in self.active_states and self._last_state == self.idle_state:
+            self._in_cycle = True
+            self._cycle_start_time = t
+            self._cycle_records = [dict(record)]
+
+        # Case 3: Active to Idle transition -> Cycle End
+        elif self._in_cycle and curr_state == self.idle_state:
+            duration = t - (self._cycle_start_time or t)
+            if duration >= self.min_duration and self._cycle_records:
+                completed_kpi = self._compute_cycle_kpi(
+                    pd.DataFrame(self._cycle_records),
+                    self._cycle_start_time or t,
+                    t,
+                    duration,
+                )
+                self.completed_cycles.append(completed_kpi)
+
+            self._in_cycle = False
+            self._cycle_start_time = None
+            self._cycle_records = []
+
+        # Case 4: Ongoing active cycle sample
+        elif self._in_cycle and curr_state in self.active_states:
+            self._cycle_records.append(dict(record))
+
+        self._last_state = curr_state
+        return completed_kpi
+
     def analyze_stream(self, df: pd.DataFrame) -> List[Dict[str, Any]]:
-        """Analyzes a continuous DataFrame of telemetry and returns segmented cycle KPIs."""
+        """Analyzes a continuous DataFrame of telemetry and returns newly completed cycle KPIs."""
         if df.empty or self.trigger_tag not in df.columns:
             return []
 
         df = df.sort_values("host_timestamp").reset_index(drop=True)
         cycles = []
 
-        in_cycle = False
-        cycle_start_time = None
-        cycle_start_idx = None
-        last_state = self.idle_state
+        for _, row in df.iterrows():
+            kpi = self.feed_record(row.to_dict())
+            if kpi:
+                cycles.append(kpi)
 
-        for idx, row in df.iterrows():
-            curr_state = int(row.get(self.trigger_tag, self.idle_state))
-            t = float(row["host_timestamp"])
-
-            # Transition from Idle to Active -> Cycle Start
-            if not in_cycle and curr_state in self.active_states and last_state == self.idle_state:
-                in_cycle = True
-                cycle_start_time = t
-                cycle_start_idx = idx
-
-            # Transition from Active to Idle -> Cycle End
-            elif in_cycle and curr_state == self.idle_state:
-                cycle_end_time = t
-                duration = cycle_end_time - cycle_start_time
-
-                if duration >= self.min_duration:
-                    cycle_df = df.iloc[cycle_start_idx:idx]
-                    kpi = self._compute_cycle_kpi(cycle_df, cycle_start_time, cycle_end_time, duration)
-                    cycles.append(kpi)
-
-                in_cycle = False
-                cycle_start_time = None
-                cycle_start_idx = None
-
-            last_state = curr_state
-
-        self.completed_cycles.extend(cycles)
         return cycles
 
     def _compute_cycle_kpi(

@@ -190,36 +190,50 @@ def toggle_simulator(port: int = 5020):
 
 
 @app.post("/api/monitor/toggle")
-def toggle_monitor(host: str = "127.0.0.1", port: int = 5020):
+def toggle_monitor(
+    host: str = "127.0.0.1",
+    port: Optional[int] = None,
+    protocol: Optional[str] = None,
+    unit_id: Optional[int] = None,
+):
     global poller_instance, storage_instance, analyzer_instance
     if poller_instance is None:
-        client = ReadOnlyPLCClient(protocol="modbus_tcp", host=host, port=port)
+        res = diagnostic_state.get("result") or {}
+        actual_port = port or res.get("port") or 5020
+        raw_proto = protocol or res.get("detected_protocol") or "modbus_tcp"
+        actual_proto = "s7comm" if ("s7" in str(raw_proto).lower() or "siemens" in str(raw_proto).lower()) else "modbus_tcp"
+        actual_unit_id = unit_id or res.get("unit_id") or 1
+
+        client = ReadOnlyPLCClient(protocol=actual_proto, host=host, port=actual_port)
         storage_instance = StorageEngine()
         storage_instance.start()
 
         analyzer_instance = CycleAnalyzer()
-        cycle_buf = []
 
         def _on_telem(rec):
             live_telemetry.update(rec)
-            cycle_buf.append(rec)
-            if len(cycle_buf) >= 40:
-                import pandas as pd
-                new_c = analyzer_instance.analyze_stream(pd.DataFrame(cycle_buf))
-                for c in new_c:
-                    completed_cycles.insert(0, c)
-                    if len(completed_cycles) > 20:
-                        completed_cycles.pop()
-                cycle_buf.clear()
+            # Continuous streaming feed into cycle analyzer without fragmentation
+            new_kpi = analyzer_instance.feed_record(rec)
+            if new_kpi:
+                completed_cycles.insert(0, new_kpi)
+                if len(completed_cycles) > 20:
+                    completed_cycles.pop()
 
         poller_instance = TieredPoller(
             client=client,
             storage=storage_instance,
             tier1_interval_ms=50,
+            unit_id=actual_unit_id,
             telemetry_callback=_on_telem,
         )
         poller_instance.start()
-        return {"status": "MONITORING_ACTIVE"}
+        return {
+            "status": "MONITORING_ACTIVE",
+            "host": host,
+            "port": actual_port,
+            "protocol": actual_proto,
+            "unit_id": actual_unit_id,
+        }
     else:
         poller_instance.stop()
         poller_instance = None

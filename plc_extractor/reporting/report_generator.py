@@ -6,6 +6,7 @@ detailing PLC profile, hardware specs, network metrics, memory map, and AI integ
 
 import logging
 import os
+import re
 import time
 from typing import Any, Dict, List, Optional
 import openpyxl
@@ -24,10 +25,14 @@ class ReportGenerator:
         self.output_dir = output_dir
         os.makedirs(output_dir, exist_ok=True)
 
+    def _sanitize_name(self, name: str) -> str:
+        clean = re.sub(r'[^a-zA-Z0-9_\-\.]', '_', str(name)).strip("._")
+        return clean if clean else "Machine-01"
+
     def generate_excel_report(self, diagnostic_data: Dict[str, Any]) -> str:
         """Generates a styled, multi-sheet Excel report using openpyxl."""
         timestamp = time.strftime("%Y%m%d_%H%M%S")
-        station_name = diagnostic_data.get("station_name", "Machine-01")
+        station_name = self._sanitize_name(diagnostic_data.get("station_name", "Machine-01"))
         filename = f"Machine_Integration_Report_{station_name}_{timestamp}.xlsx"
         filepath = os.path.join(self.output_dir, filename)
 
@@ -69,9 +74,9 @@ class ReportGenerator:
             ("Hardware Serial Number", diagnostic_data.get("serial_number", "N/A")),
             ("Physical Rack / Slot", f"Rack {diagnostic_data.get('rack', 0)} / Slot {diagnostic_data.get('slot', 1)}"),
             ("Communication Safety Status", "100% STRICT READ-ONLY (Zero Plant Impact)"),
-            ("Network Response Latency", f"{diagnostic_data.get('avg_latency_ms', 0.5):.2f} ms"),
+            ("Network Response Latency", f"{diagnostic_data.get('avg_latency_ms', 0.0):.2f} ms"),
             ("Recommended Polling Frequency", f"{diagnostic_data.get('recommended_poll_rate_hz', 20)} Hz (every {diagnostic_data.get('recommended_interval_ms', 50)} ms)"),
-            ("Total Discovered Tags / Registers", diagnostic_data.get("total_tags_count", 20)),
+            ("Total Discovered Tags / Registers", diagnostic_data.get("total_tags_count", 0)),
         ]
 
         ws1.append([])
@@ -106,31 +111,32 @@ class ReportGenerator:
             cell.alignment = Alignment(horizontal="center", vertical="center")
 
         tags_list = diagnostic_data.get("tags", [])
-        if not tags_list:
-            # Default template tags
-            tags_list = [
-                {"name": "machine_state", "protocol": "Modbus TCP", "area": "Holding Register", "address": "0", "data_type": "UINT16", "tier": "Tier 1 (50ms)", "desc": "0=Idle, 1=Clamp, 2=Process, 3=Cool, 4=Eject"},
-                {"name": "cycle_trigger", "protocol": "Modbus TCP", "area": "Holding Register", "address": "1", "data_type": "BOOL", "tier": "Tier 1 (50ms)", "desc": "Active Cycle Indicator Bit"},
-                {"name": "hydraulic_pressure", "protocol": "Modbus TCP", "area": "Holding Register", "address": "2", "data_type": "INT16 (x10)", "tier": "Tier 1 (50ms)", "desc": "Main Cylinder Pressure (Bar)"},
-                {"name": "motor_current", "protocol": "Modbus TCP", "area": "Holding Register", "address": "3", "data_type": "INT16 (x10)", "tier": "Tier 1 (50ms)", "desc": "Pump Motor Current (Amps)"},
-                {"name": "oil_temperature", "protocol": "Modbus TCP", "area": "Holding Register", "address": "20", "data_type": "INT16 (x10)", "tier": "Tier 2 (1s)", "desc": "Reservoir Oil Temperature (°C)"},
-                {"name": "shift_counter", "protocol": "Modbus TCP", "area": "Holding Register", "address": "30-31", "data_type": "UINT32", "tier": "Tier 3 (10s)", "desc": "Total Parts Completed in Shift"},
-            ]
+        status = diagnostic_data.get("status", "UNKNOWN")
 
-        for t in tags_list:
-            ws2.append([
-                t.get("name", "N/A"),
-                t.get("protocol", "Modbus TCP"),
-                t.get("area", "Holding Register"),
-                str(t.get("address", "0")),
-                t.get("data_type", "UINT16"),
-                t.get("tier", "Tier 1 (50ms)"),
-                t.get("desc", ""),
-            ])
+        if not tags_list:
+            if status in ("UNREACHABLE", "COMMUNICATION_FAILED", "FAILED"):
+                ws2.append(["N/A", diagnostic_data.get("detected_protocol", "N/A"), "N/A", "N/A", "N/A", "N/A", "لا توجد متغيرات مستخرجة - تعذر الاتصال بالمعالج أو لم يستجب للقراءة المباشرة"])
+            else:
+                ws2.append(["N/A", "N/A", "N/A", "N/A", "N/A", "N/A", "لم يتم اكتشاف متغيرات نشطة"])
             r = ws2.max_row
             for col in range(1, len(tags_headers) + 1):
                 ws2.cell(row=r, column=col).border = thin_border
                 ws2.cell(row=r, column=col).font = regular_font
+        else:
+            for t in tags_list:
+                ws2.append([
+                    t.get("name", "N/A"),
+                    t.get("protocol", diagnostic_data.get("detected_protocol", "Modbus TCP")),
+                    t.get("area", "Holding Register"),
+                    str(t.get("address", "0")),
+                    t.get("data_type", "UINT16"),
+                    t.get("tier", "Tier 1 (50ms)"),
+                    t.get("desc", ""),
+                ])
+                r = ws2.max_row
+                for col in range(1, len(tags_headers) + 1):
+                    ws2.cell(row=r, column=col).border = thin_border
+                    ws2.cell(row=r, column=col).font = regular_font
 
         # ----------------------------------------------------------------------
         # SHEET 3: AI & Engineering Integration Recommendations
@@ -180,13 +186,40 @@ class ReportGenerator:
     def generate_markdown_report(self, diagnostic_data: Dict[str, Any]) -> str:
         """Generates a clean Markdown/Text report ready to upload or review."""
         timestamp = time.strftime("%Y%m%d_%H%M%S")
-        station_name = diagnostic_data.get("station_name", "Machine-01")
+        station_name = self._sanitize_name(diagnostic_data.get("station_name", "Machine-01"))
         filename = f"Machine_Integration_Report_{station_name}_{timestamp}.md"
         filepath = os.path.join(self.output_dir, filename)
+
+        tags_list = diagnostic_data.get("tags", [])
+        status = diagnostic_data.get("status", "UNKNOWN")
+
+        if tags_list:
+            tags_table_rows = "\n".join([
+                f"| `{t.get('name', 'N/A')}` | `{t.get('data_type', 'UINT16')}` | {t.get('area') or t.get('address', '0')} | {t.get('tier', 'Tier 1 (50ms)')} | {t.get('desc', '')} |"
+                for t in tags_list
+            ])
+            tags_section = f"""| اسم المتغير (Tag Name) | نوع المتغير (Data Type) | العنوان / Offset | معدل التحديث الموصى به | الغرض الصناعي والقيمة الحالية |
+| :--- | :--- | :--- | :--- | :--- |
+{tags_table_rows}"""
+        elif status in ("UNREACHABLE", "COMMUNICATION_FAILED", "FAILED"):
+            tags_section = "*لا توجد متغيرات مستخرجة - تعذر الاتصال بالمعالج أو لم يستجب للقراءة المباشرة.*"
+        else:
+            tags_section = "*لم يتم اكتشاف متغيرات نشطة على المعالج.*"
+
+        rec_items = "\n".join([
+            f"{i+1}. **{domain}:**\n   - {rec}"
+            for i, (domain, rec) in enumerate(diagnostic_data.get("recommendations", [
+                ("طريقة الاتصال المستقر", "الحفاظ على جلسة اتصال TCP واحدة دائمة وتجنب فتح/إغلاق الاتصال في كل لفة."),
+                ("محرك التخزين والأداء", "استخدام محرك DuckDB + Parquet المفصول لتجميع البيانات في الذاكرة وكتابتها كل ساعة لمنع استهلاك وسائط التخزين."),
+                ("كشف الدورات بدقة", "الربط بين تغير حالة الماكينة وارتفاع ضغط التشغيل لتفادي أي ارتداد إشارة."),
+                ("حماية الماكينة بنسبة 100%", "الاستمرار في تفعيل جدار حماية القراءة فقط (ReadOnlyPLCClient) لضمان عدم حدوث أي تغيير في كود الـ PLC الأصلي."),
+            ]))
+        ])
 
         md_content = f"""# 🏭 تقرير الفحص الفني الشامل وتوصيات الربط الآمن للماكينة
 > **Station:** {station_name} | **Target IP:** `{diagnostic_data.get('target_ip', '127.0.0.1')}`
 > **Generated:** {time.strftime('%Y-%m-%d %H:%M:%S')} | **Safety Profile:** `STRICT_READ_ONLY (100% Safe)`
+> **Status:** `{status}`
 
 ---
 
@@ -195,39 +228,25 @@ class ReportGenerator:
 | البند الفني (Technical Property) | القيمة المستخرجة (Detected Value) | الملاحظات الهندسية |
 | :--- | :--- | :--- |
 | **عنوان الآي بي (Target IP)** | `{diagnostic_data.get('target_ip', '127.0.0.1')}` | ثابت في شبكة الـ OT |
-| **البروتوكول الصناعي** | **`{diagnostic_data.get('detected_protocol', 'Modbus TCP')}`** | المنفذ المفتوح والمستجيب |
-| **المصنع / الفيرموير (Firmware)** | `{diagnostic_data.get('firmware_version', 'Siemens / Standard Industrial')}` | تم التعرف عليه برمجياً |
+| **البروتوكول الصناعي** | **`{diagnostic_data.get('detected_protocol', 'Modbus TCP')}`** | المنفذ المستجيب |
+| **المصنع / الفيرموير (Firmware)** | `{diagnostic_data.get('firmware_version', 'Detected / Standard')}` | تم التعرف عليه برمجياً |
 | **نوع الموديل (Hardware Type)** | `{diagnostic_data.get('module_type', 'Standard PLC')}` | متوافق مع الحزمة |
 | **الرقم التسلسلي (Serial Number)** | `{diagnostic_data.get('serial_number', 'N/A')}` | موثق للأرشفة |
 | **مستوى الأمان التشغيلي** | **قراءة فقط صارمة (Strict Read-Only)** | محظور أي أمر كتابة أو إيقاف |
-| **متوسط زمن الاستجابة (Latency)** | **`{diagnostic_data.get('avg_latency_ms', 0.5):.2f} ms`** | استجابة ممتازة وسريعة |
+| **متوسط زمن الاستجابة (Latency)** | **`{diagnostic_data.get('avg_latency_ms', 0.0):.2f} ms`** | استجابة القراءة الحية |
 | **أقصى سرعة سحب موصى بها** | **`{diagnostic_data.get('recommended_poll_rate_hz', 20)} Hz` ({diagnostic_data.get('recommended_interval_ms', 50)}ms)** | كافية لكشف كل دورات الماكينة |
 
 ---
 
 ## 2. مصفوفة العناوين المكتشفة (Discovered Memory Map)
 
-| اسم المتغير (Tag Name) | نوع المتغير (Data Type) | العنوان / Offset | معدل التحديث الموصى به | الغرض الصناعي |
-| :--- | :--- | :--- | :--- | :--- |
-| `machine_state` | `UINT16` | Register 0 | Tier 1 (50ms) | حالة الماكينة الحالية (0=Idle, 1=Clamp, 2=Process, 3=Cool, 4=Eject) |
-| `cycle_trigger` | `BOOL` | Register 1 | Tier 1 (50ms) | مؤشر بدء واكتمال الدورة الإنتاجية |
-| `hydraulic_pressure`| `INT16 (x10)` | Register 2 | Tier 1 (50ms) | ضغط الهيدروليك الفعلي (Bar) |
-| `motor_current` | `INT16 (x10)` | Register 3 | Tier 1 (50ms) | أمبير المحرك الرئيسي (Amps) |
-| `oil_temperature` | `INT16 (x10)` | Register 20 | Tier 2 (1s) | حرارة زيت الهيدروليك (°C) |
-| `shift_counter` | `UINT32` | Register 30-31 | Tier 3 (10s) | إجمالي القطع المنتجة في الوردية |
+{tags_section}
 
 ---
 
 ## 3. التوصيات الهندسية لأفضل طريقة ربط (AI & OT Recommendations)
 
-1. **طريقة الاتصال المستقر:**
-   - الحفاظ على جلسة اتصال TCP واحدة دائمة (Single Persistent Session) وتجنب فتح/إغلاق الاتصال في كل لفة.
-2. **محرك التخزين والأداء:**
-   - استخدام محرك `DuckDB + Parquet` المفصول لتجميع البيانات في الذاكرة وكتابتها كل ساعة لمنع استهلاك كارت الذاكرة أو بطء الجهاز.
-3. **كشف الدورات بدقة:**
-   - الربط بين تغير حالة الماكينة (`machine_state > 0`) وارتفاع ضغط الهيدروليك لتفادي أي ارتداد إشارة أو تشويش كهربائي.
-4. **حماية الماكينة بنسبة 100%:**
-   - الاستمرار في تفعيل جدار حماية القراءة فقط (`ReadOnlyPLCClient`) لضمان عدم حدوث أي تغيير في كود الـ PLC الأصلي.
+{rec_items}
 
 ---
 *تم إنشاء هذا التقرير تلقائياً بواسطة نظام Machine Network Control.*
@@ -246,7 +265,7 @@ class ReportGenerator:
         """
         import json
         timestamp = time.strftime("%Y%m%d_%H%M%S")
-        station_name = diagnostic_data.get("station_name", "Machine-01")
+        station_name = self._sanitize_name(diagnostic_data.get("station_name", "Machine-01"))
         filename = f"tags_config_{station_name}_{timestamp}.json"
         filepath = os.path.join(self.output_dir, filename)
 
