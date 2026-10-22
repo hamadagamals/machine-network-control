@@ -14,6 +14,7 @@ logger = logging.getLogger("ProtocolProbe")
 
 STANDARD_PORTS = {
     502: "Modbus TCP",
+    5020: "Modbus TCP (Sim / Alternate)",
     102: "Siemens S7comm (ISO-on-TCP)",
     44818: "EtherNet/IP (CIP)",
     4840: "OPC UA",

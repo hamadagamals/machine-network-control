@@ -21,9 +21,15 @@ class AutoDiagnosticsEngine:
     Designed for zero manual terminal interaction.
     """
 
-    def __init__(self, target_host: str = "127.0.0.1", station_name: str = "Machine-01"):
+    def __init__(
+        self,
+        target_host: str = "127.0.0.1",
+        station_name: str = "Machine-01",
+        target_port: Optional[int] = None,
+    ):
         self.target_host = target_host
         self.station_name = station_name
+        self.target_port = target_port
         self.report_gen = ReportGenerator()
         self.progress_callback: Optional[Callable[[int, str, Optional[Dict[str, Any]]], None]] = None
 
@@ -74,6 +80,15 @@ class AutoDiagnosticsEngine:
         self._emit(10, f"جاري فحص اتصال الشبكة والمنافذ المفتوحة على {self.target_host}...")
         probe = ProtocolProbe(host=self.target_host, timeout=1.5)
         open_ports = probe.check_open_ports()
+
+        # If user explicitly specified a port, ensure it is probed
+        if self.target_port and self.target_port not in open_ports:
+            import socket
+            sock = socket.socket()
+            sock.settimeout(0.5)
+            open_ports[self.target_port] = (sock.connect_ex((self.target_host, self.target_port)) == 0)
+            sock.close()
+
         diagnostic_result["open_ports"] = open_ports
 
         active_port = None
@@ -81,17 +96,6 @@ class AutoDiagnosticsEngine:
             if is_open:
                 active_port = port
                 break
-
-        # Check if local mock PLC is running on 5020 or 502
-        if not active_port:
-            # Check candidate port 5020 for simulated machines
-            import socket
-            sock = socket.socket()
-            sock.settimeout(0.5)
-            if sock.connect_ex((self.target_host, 5020)) == 0:
-                active_port = 5020
-                open_ports[5020] = True
-            sock.close()
 
         self._emit(25, f"تم فحص المنافذ. المنافذ المستجيبة: {[p for p, o in open_ports.items() if o]}")
 
@@ -106,7 +110,7 @@ class AutoDiagnosticsEngine:
             diagnostic_result["recommendations"] = [
                 ("فحص التوصيل الفيزيائي", f"تأكد من توصيل كابل الإيثرنت بين الكمبيوتر وماكينة الـ PLC على العنوان {self.target_host}."),
                 ("فحص عنوان الـ IP والسابنت", "تأكد من ضبط كارت الشبكة في الكمبيوتر ليكون على نفس نطاق الـ IP للماكينة (مثلاً: 192.168.1.X)."),
-                ("فحص جدار الحماية", "تأكد من عدم وجود راوتر أو جدار حماية صناعي يحظر منافذ التحكم (502, 102, 44818, 4840)."),
+                ("فحص جدار الحماية", "تأكد من عدم وجود راوتر أو جدار حماية صناعي يحظر منافذ التحكم (502, 5020, 102, 44818, 4840)."),
                 ("وضع المحاكاة", "إذا كنت تقوم بتجربة البرنامج محلياً، اضغط زر [تشغيل ماكينة افتراضية للتجربة] ثم أعد الفحص."),
             ]
             excel_path = self.report_gen.generate_excel_report(diagnostic_result)
@@ -122,10 +126,10 @@ class AutoDiagnosticsEngine:
         # ----------------------------------------------------------------------
         self._emit(35, "جاري فحص وتحديد نوع المعالج والبروتوكول الصناعي بدقة...")
 
-        # Probe candidate ports without skipping others if handshake returns None
         target_port = None
         discovered_unit_id = 1
 
+        # 1. Prioritize Siemens S7 if port 102 is open
         if open_ports.get(102):
             s7_meta = probe.probe_s7comm(port=102)
             if s7_meta:
@@ -138,23 +142,28 @@ class AutoDiagnosticsEngine:
                 target_port = 102
                 diagnostic_result["port"] = 102
 
-        if not target_port and (open_ports.get(502) or open_ports.get(5020)):
-            cand_p = 502 if open_ports.get(502) else 5020
-            mb_meta = probe.probe_modbus(port=cand_p)
-            if mb_meta:
-                diagnostic_result["detected_protocol"] = "Modbus TCP"
-                diagnostic_result["vendor"] = "Industrial Controller (Modbus Standard)"
-                diagnostic_result["module_type"] = "PLC / Gateway"
-                discovered_unit_id = mb_meta.get("primary_unit_id", 1)
-                diagnostic_result["unit_id"] = discovered_unit_id
-                target_port = cand_p
-                diagnostic_result["port"] = cand_p
-            else:
-                # Port is open but Modbus probe failed (e.g. invalid response)
-                target_port = cand_p
-                diagnostic_result["detected_protocol"] = "Modbus TCP (Unresponsive Unit ID)"
-                diagnostic_result["port"] = cand_p
+        # 2. Prioritize Modbus TCP across standard & simulation ports
+        if not target_port:
+            candidate_modbus = []
+            if self.target_port and self.target_port not in (102, 44818, 4840) and open_ports.get(self.target_port):
+                candidate_modbus.append(self.target_port)
+            for p in [502, 5020]:
+                if open_ports.get(p) and p not in candidate_modbus:
+                    candidate_modbus.append(p)
 
+            for cand_p in candidate_modbus:
+                mb_meta = probe.probe_modbus(port=cand_p)
+                if mb_meta:
+                    diagnostic_result["detected_protocol"] = "Modbus TCP"
+                    diagnostic_result["vendor"] = "Industrial Controller (Modbus Standard)"
+                    diagnostic_result["module_type"] = "PLC / Gateway"
+                    discovered_unit_id = mb_meta.get("primary_unit_id", 1)
+                    diagnostic_result["unit_id"] = discovered_unit_id
+                    target_port = cand_p
+                    diagnostic_result["port"] = cand_p
+                    break
+
+        # 3. Rockwell CIP
         if not target_port and open_ports.get(44818):
             diagnostic_result["detected_protocol"] = "Rockwell EtherNet/IP (CIP)"
             diagnostic_result["vendor"] = "Rockwell Automation (Allen-Bradley)"
@@ -162,6 +171,7 @@ class AutoDiagnosticsEngine:
             target_port = 44818
             diagnostic_result["port"] = 44818
 
+        # 4. OPC UA Server
         if not target_port and open_ports.get(4840):
             diagnostic_result["detected_protocol"] = "OPC UA Server"
             diagnostic_result["vendor"] = "OPC Foundation Standard"
@@ -179,51 +189,59 @@ class AutoDiagnosticsEngine:
         latencies = []
 
         is_s7 = "Siemens" in diagnostic_result["detected_protocol"] or "s7" in diagnostic_result["detected_protocol"].lower()
+        is_opcua = "OPC UA" in diagnostic_result["detected_protocol"]
         protocol_str = "s7comm" if is_s7 else "modbus_tcp"
-
-        client = ReadOnlyPLCClient(
-            protocol=protocol_str,
-            host=self.target_host,
-            port=target_port,
-        )
 
         live_registers_read = []
         comm_success = False
 
-        try:
-            if client.connect():
-                for _ in range(5):
-                    t0 = time.perf_counter()
-                    try:
-                        if is_s7:
-                            db_bytes = client.read_s7_db(db_number=1, start=0, size=32)
-                            if db_bytes and len(db_bytes) >= 2:
-                                import struct
-                                if not live_registers_read:
-                                    live_registers_read = [struct.unpack(">H", db_bytes[i : i + 2])[0] for i in range(0, len(db_bytes) - 1, 2)]
-                                latencies.append((time.perf_counter() - t0) * 1000.0)
-                                comm_success = True
-                        else:
-                            # Modbus read 0..24 safe batch read using discovered unit_id
-                            regs = client.read_holding_registers(address=0, count=25, unit_id=discovered_unit_id)
-                            if regs:
-                                if not live_registers_read:
-                                    live_registers_read = regs
-                                latencies.append((time.perf_counter() - t0) * 1000.0)
-                                comm_success = True
-                    except Exception as e:
-                        logger.debug(f"Read sample failure: {e}")
-                        break
-                    time.sleep(0.02)
-                client.disconnect()
-        except Exception as e:
-            logger.debug(f"Test poll connection error: {e}")
-
-        if latencies:
-            avg_lat = sum(latencies) / len(latencies)
-            diagnostic_result["avg_latency_ms"] = round(avg_lat, 2)
-        else:
+        if is_opcua:
+            diagnostic_result["status"] = "OPC_UA_DETECTED"
             diagnostic_result["avg_latency_ms"] = 0.0
+            diagnostic_result["recommendations"] = [
+                ("اكتشاف خادم OPC UA", f"تم اكتشاف خادم OPC UA نشط على المنفذ {target_port}."),
+                ("طريقة القراءة الصناعية", f"لقراءة المتغيرات عبر OPC UA، يرجى تفعيل نقطة اتصال opc.tcp://{self.target_host}:{target_port} أو تفعيل منفذ Modbus TCP (502 / 5020) على الماكينة."),
+            ]
+        else:
+            client = ReadOnlyPLCClient(
+                protocol=protocol_str,
+                host=self.target_host,
+                port=target_port,
+            )
+            try:
+                if client.connect():
+                    for _ in range(5):
+                        t0 = time.perf_counter()
+                        try:
+                            if is_s7:
+                                db_bytes = client.read_s7_db(db_number=1, start=0, size=32)
+                                if db_bytes and len(db_bytes) >= 2:
+                                    import struct
+                                    if not live_registers_read:
+                                        live_registers_read = [struct.unpack(">H", db_bytes[i : i + 2])[0] for i in range(0, len(db_bytes) - 1, 2)]
+                                    latencies.append((time.perf_counter() - t0) * 1000.0)
+                                    comm_success = True
+                            else:
+                                # Modbus read 0..24 safe batch read using discovered unit_id
+                                regs = client.read_holding_registers(address=0, count=25, unit_id=discovered_unit_id)
+                                if regs:
+                                    if not live_registers_read:
+                                        live_registers_read = regs
+                                    latencies.append((time.perf_counter() - t0) * 1000.0)
+                                    comm_success = True
+                        except Exception as e:
+                            logger.debug(f"Read sample failure: {e}")
+                            break
+                        time.sleep(0.02)
+                    client.disconnect()
+            except Exception as e:
+                logger.debug(f"Test poll connection error: {e}")
+
+            if latencies:
+                avg_lat = sum(latencies) / len(latencies)
+                diagnostic_result["avg_latency_ms"] = round(avg_lat, 2)
+            else:
+                diagnostic_result["avg_latency_ms"] = 0.0
 
         # ----------------------------------------------------------------------
         # STEP 4: Memory Mapping & Tag Enumeration (70 - 85%)

@@ -2,8 +2,8 @@
   "version": "1.0",
   "station_name": "Machine-01",
   "target_ip": "127.0.0.1",
-  "port": 502,
-  "protocol": "Unknown",
+  "port": 5020,
+  "protocol": "Modbus TCP",
   "safety_profile": "STRICT_READ_ONLY",
   "intervals_ms": {
     "tier_1_high_speed": 50,
@@ -14,7 +14,7 @@
     "tags": [
       {
         "name": "machine_state",
-        "protocol": "Unknown",
+        "protocol": "Modbus TCP",
         "area": "Register 0",
         "address": "0",
         "data_type": "UINT16",
@@ -23,7 +23,7 @@
       },
       {
         "name": "cycle_trigger",
-        "protocol": "Unknown",
+        "protocol": "Modbus TCP",
         "area": "Register 1",
         "address": "1",
         "data_type": "BOOL",
@@ -32,43 +32,70 @@
       },
       {
         "name": "hydraulic_pressure",
-        "protocol": "Unknown",
+        "protocol": "Modbus TCP",
         "area": "Register 2",
         "address": "2",
         "data_type": "INT16 (x10)",
         "tier": "Tier 1 (50ms)",
-        "desc": "ضغط الهيدروليك (القيمة الحالية: 0.0 Bar)"
+        "desc": "ضغط الهيدروليك (القيمة الحالية: 5.3 Bar)"
       },
       {
         "name": "motor_current",
-        "protocol": "Unknown",
+        "protocol": "Modbus TCP",
         "area": "Register 3",
         "address": "3",
         "data_type": "INT16 (x10)",
         "tier": "Tier 1 (50ms)",
-        "desc": "أمبير المحرك الرئيسي (القيمة الحالية: 0.0 A)"
+        "desc": "أمبير المحرك الرئيسي (القيمة الحالية: 4.5 A)"
       },
       {
         "name": "oil_temperature",
-        "protocol": "Unknown",
+        "protocol": "Modbus TCP",
         "area": "Register 20",
         "address": "20",
         "data_type": "INT16 (x10)",
         "tier": "Tier 2 (1s)",
-        "desc": "حرارة زيت الهيدروليك (°C)"
+        "desc": "حرارة زيت الهيدروليك (°C) (القيمة الحالية: 49.7 °C)"
       },
       {
         "name": "shift_counter",
-        "protocol": "Unknown",
+        "protocol": "Modbus TCP",
         "area": "Register 30-31",
         "address": "30-31",
         "data_type": "UINT32",
         "tier": "Tier 3 (10s)",
         "desc": "إجمالي القطع المكتملة في الوردية"
+      },
+      {
+        "name": "aux_parameter_r4",
+        "protocol": "Modbus TCP",
+        "area": "Register 4",
+        "address": "4",
+        "data_type": "UINT16",
+        "tier": "Tier 2 (1s)",
+        "desc": "متغير تشغيلي نشط مكتشف على الماكينة (القيمة الحالية: 1282)"
+      },
+      {
+        "name": "aux_parameter_r5",
+        "protocol": "Modbus TCP",
+        "area": "Register 5",
+        "address": "5",
+        "data_type": "UINT16",
+        "tier": "Tier 2 (1s)",
+        "desc": "متغير تشغيلي نشط مكتشف على الماكينة (القيمة الحالية: 60313)"
+      },
+      {
+        "name": "aux_parameter_r6",
+        "protocol": "Modbus TCP",
+        "area": "Register 6",
+        "address": "6",
+        "data_type": "UINT16",
+        "tier": "Tier 2 (1s)",
+        "desc": "متغير تشغيلي نشط مكتشف على الماكينة (القيمة الحالية: 65413)"
       }
     ],
-    "total_tags": 6
+    "total_tags": 9
   },
   "poller_ready": true,
-  "generated_at": "2026-10-21 15:42:48"
+  "generated_at": "2026-10-22 09:05:16"
 }

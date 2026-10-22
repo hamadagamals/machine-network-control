@@ -69,6 +69,7 @@ analyzer_instance: Optional[CycleAnalyzer] = None
 class AuditRequest(BaseModel):
     ip_address: str = "127.0.0.1"
     station_name: str = "Machine-01"
+    port: Optional[int] = None
 
 
 class AnswerSubmission(BaseModel):
@@ -95,7 +96,11 @@ def start_audit(req: AuditRequest):
     diagnostic_state["result"] = None
 
     def _run():
-        engine = AutoDiagnosticsEngine(target_host=req.ip_address, station_name=req.station_name)
+        engine = AutoDiagnosticsEngine(
+            target_host=req.ip_address,
+            target_port=req.port,
+            station_name=req.station_name,
+        )
         def _cb(percent, msg, partial):
             diagnostic_state["progress_percent"] = percent
             diagnostic_state["current_step"] = msg
@@ -501,9 +506,11 @@ HTML_CONTENT = """
     <div class="control-bar">
         <div class="input-group">
             <label for="plc-ip">عنوان الـ PLC:</label>
-            <input type="text" id="plc-ip" class="input-field" value="127.0.0.1" style="width: 140px;">
+            <input type="text" id="plc-ip" class="input-field" value="127.0.0.1" style="width: 130px;">
+            <label for="plc-port">المنفذ:</label>
+            <input type="text" id="plc-port" class="input-field" placeholder="تلقائي" style="width: 75px;" title="اتركه فارغاً للفحص الآلي التلقائي للمنافذ أو اكتب 502 / 5020 / 102">
             <label for="station-name">اسم الماكينة:</label>
-            <input type="text" id="station-name" class="input-field" value="Machine-01" style="width: 130px;">
+            <input type="text" id="station-name" class="input-field" value="Machine-01" style="width: 120px;">
         </div>
         <div class="btn-group">
             <button class="btn btn-primary" onclick="startAutoAudit()">
@@ -635,11 +642,13 @@ HTML_CONTENT = """
         // 1-Click Auto Audit
         function startAutoAudit() {
             const ip = document.getElementById('plc-ip').value;
+            const portRaw = document.getElementById('plc-port') ? document.getElementById('plc-port').value.trim() : '';
+            const port = portRaw ? parseInt(portRaw, 10) : null;
             const station = document.getElementById('station-name').value;
             fetch('/api/audit/start', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({ ip_address: ip, station_name: station })
+                body: JSON.stringify({ ip_address: ip, port: port, station_name: station })
             });
         }
 
