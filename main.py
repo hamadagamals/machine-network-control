@@ -26,6 +26,7 @@ from rich.table import Table
 from rich.panel import Panel
 
 from plc_extractor.scanner.protocol_probe import ProtocolProbe
+from plc_extractor.scanner.network_discovery import IndustrialNetworkScanner, COMMON_INDUSTRIAL_SUBNETS
 from plc_extractor.discovery.pcap_memory_mapper import PCAPMemoryMapper
 from plc_extractor.client.readonly_wrapper import ReadOnlyPLCClient, PLCWriteAttemptBlockedError
 from plc_extractor.backup.plc_snapshot import PLCSnapshot
@@ -57,6 +58,37 @@ def load_config(config_path: str = "config/default_config.yaml") -> dict:
         "cycle_analysis": {"golden_cycle": {"expected_duration_seconds": 12.5}},
         "dashboard": {"host": "0.0.0.0", "port": 8088}
     }
+
+
+def cmd_discover(args):
+    """Scans local subnets safely using Layer-2 ARP to discover industrial PLCs."""
+    console.print(Panel("[bold cyan]Scanning Network for Industrial Controllers (Strictly Read-Only)[/bold cyan]"))
+    scanner = IndustrialNetworkScanner(timeout=args.timeout)
+    custom = [args.subnet] if args.subnet else None
+
+    with console.status("[bold green]Discovering active devices...[/bold green]"):
+        res = scanner.auto_discover_all(custom_subnets=custom)
+
+    table = Table(title=f"Industrial Network Discovery Results ({res['total_found']} Devices Found)")
+    table.add_column("IP Address", style="cyan", no_wrap=True)
+    table.add_column("MAC Address", style="magenta")
+    table.add_column("Vendor / Device", style="green")
+    table.add_column("Open ICS Ports", style="yellow")
+    table.add_column("Type", style="bold")
+
+    for d in res["devices"]:
+        is_plc = d.get("is_industrial_plc", False)
+        type_str = "[bold green]Industrial PLC[/bold green]" if is_plc else "Network Device"
+        ports_str = ", ".join(str(p) for p in d.get("open_ports", [])) or "None"
+        table.add_row(
+            d["ip"],
+            d["mac"],
+            d["vendor"],
+            ports_str,
+            type_str,
+        )
+
+    console.print(table)
 
 
 def cmd_probe(args):
@@ -206,6 +238,11 @@ def main():
     parser = argparse.ArgumentParser(description="Machine Network Control: Industrial PLC Extractor & Cycle Analyzer")
     subparsers = parser.add_subparsers(dest="command", help="Sub-commands")
 
+    # discover
+    p_disc = subparsers.add_parser("discover", help="Auto-discover factory PLCs on local subnets safely")
+    p_disc.add_argument("--subnet", default=None, help="Target CIDR subnet (e.g. 192.168.0.0/24)")
+    p_disc.add_argument("--timeout", type=float, default=0.35, help="Socket timeout seconds")
+
     # probe
     p_probe = subparsers.add_parser("probe", help="Scan and fingerprint target PLC")
     p_probe.add_argument("--host", required=True, help="PLC IP address")
@@ -239,7 +276,9 @@ def main():
     p_gui.add_argument("--port", type=int, default=8088, help="Web portal port")
 
     args = parser.parse_args()
-    if args.command == "probe":
+    if args.command == "discover":
+        cmd_discover(args)
+    elif args.command == "probe":
         cmd_probe(args)
     elif args.command == "map-pcap":
         cmd_map_pcap(args)
@@ -252,6 +291,11 @@ def main():
     elif args.command == "gui" or args.command is None:
         import uvicorn
         port = getattr(args, "port", 8088) or 8088
+        # Check if requested port is in use, fallback to 8089
+        import socket
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as _s:
+            if _s.connect_ex(("127.0.0.1", port)) == 0 and port == 8088:
+                port = 8089
         host = getattr(args, "host", "0.0.0.0") or "0.0.0.0"
         console.print(Panel(
             f"[bold green]Starting Machine Network Control - Automated Web Portal[/bold green]\n"

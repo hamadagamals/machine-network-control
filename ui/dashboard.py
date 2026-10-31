@@ -15,6 +15,7 @@ from fastapi.responses import HTMLResponse, FileResponse
 from pydantic import BaseModel
 
 from plc_extractor.scanner.auto_diagnostics import AutoDiagnosticsEngine
+from plc_extractor.scanner.network_discovery import IndustrialNetworkScanner, COMMON_INDUSTRIAL_SUBNETS
 from plc_extractor.simulator.mock_plc_server import MockIndustrialMachinePLC
 from plc_extractor.client.readonly_wrapper import ReadOnlyPLCClient
 from plc_extractor.acquisition.storage_engine import StorageEngine
@@ -25,6 +26,17 @@ logger = logging.getLogger("Dashboard")
 app = FastAPI(title="Machine Network Control - Automated Industrial Portal")
 
 # Global System State
+discovery_state: Dict[str, Any] = {
+    "is_scanning": False,
+    "progress_percent": 0,
+    "current_step": "جاهز للاكتشاف",
+    "result": None,
+}
+
+class DiscoveryRequest(BaseModel):
+    custom_subnets: Optional[List[str]] = None
+
+
 diagnostic_state: Dict[str, Any] = {
     "is_running": False,
     "progress_percent": 0,
@@ -179,6 +191,54 @@ def download_config():
         )
     raise HTTPException(status_code=404, detail="No Tags config available yet. Run audit first.")
 
+
+
+@app.get("/api/network/adapters")
+def get_adapters():
+    scanner = IndustrialNetworkScanner()
+    return {
+        "adapters": scanner.get_local_adapters(),
+        "common_subnets": COMMON_INDUSTRIAL_SUBNETS,
+    }
+
+
+@app.post("/api/network/discover")
+def start_discovery(req: Optional[DiscoveryRequest] = None):
+    global discovery_state
+    if discovery_state["is_scanning"]:
+        return {"status": "ALREADY_SCANNING"}
+
+    discovery_state["is_scanning"] = True
+    discovery_state["progress_percent"] = 5
+    discovery_state["current_step"] = "بدء فحص الشبكة الصناعية بالطبقة الثانية (Layer-2)..."
+    discovery_state["result"] = None
+
+    custom = req.custom_subnets if req else None
+
+    def _run():
+        scanner = IndustrialNetworkScanner(timeout=0.35, max_workers=50)
+
+        def _cb(pct, msg):
+            discovery_state["progress_percent"] = pct
+            discovery_state["current_step"] = msg
+
+        res = scanner.auto_discover_all(progress_cb=_cb, custom_subnets=custom)
+        discovery_state["is_scanning"] = False
+        discovery_state["result"] = res
+
+    threading.Thread(target=_run, daemon=True).start()
+    return {"status": "STARTED"}
+
+
+@app.get("/api/network/discover/status")
+def get_discovery_status():
+    return discovery_state
+
+
+@app.get("/api/network/arp_cache")
+def get_arp_cache():
+    scanner = IndustrialNetworkScanner()
+    return {"entries": scanner.read_system_arp_cache()}
 
 
 @app.post("/api/simulator/toggle")
@@ -513,6 +573,9 @@ HTML_CONTENT = """
             <input type="text" id="station-name" class="input-field" value="Machine-01" style="width: 120px;">
         </div>
         <div class="btn-group">
+            <button class="btn btn-secondary" onclick="openDiscoveryModal()" style="border-color: var(--accent-cyan); color: var(--accent-cyan);">
+                <span>🔍</span> اكتشاف الماكينات في الشبكة تلقائياً
+            </button>
             <button class="btn btn-primary" onclick="startAutoAudit()">
                 <span>🚀</span> بدء الفحص الآلي الشامل للماكينة
             </button>
@@ -522,6 +585,67 @@ HTML_CONTENT = """
             <button class="btn btn-secondary" id="btn-sim" onclick="toggleSimulator()">
                 <span>🤖</span> تشغيل ماكينة افتراضية للتجربة
             </button>
+        </div>
+    </div>
+
+    <!-- Auto Discovery Modal -->
+    <div id="discoveryModal" style="display:none; position:fixed; z-index:9999; left:0; top:0; width:100%; height:100%; background:rgba(0,0,0,0.8); backdrop-filter:blur(4px); align-items:center; justify-content:center;">
+        <div style="background:var(--bg-card); border:1px solid var(--border-color); border-radius:16px; width:90%; max-width:780px; max-height:90vh; overflow-y:auto; padding:24px; position:relative; box-shadow:0 12px 36px rgba(0,0,0,0.6);">
+            <div style="display:flex; justify-content:space-between; align-items:center; border-bottom:1px solid var(--border-color); padding-bottom:14px; margin-bottom:16px;">
+                <h2 style="font-size:18px; color:#FFF; display:flex; align-items:center; gap:8px;">
+                    <span>🔍</span> كاشف الماكينات وأجهزة الشبكة الصناعية (Auto-Discovery)
+                </h2>
+                <button onclick="closeDiscoveryModal()" style="background:transparent; border:none; color:var(--text-muted); font-size:24px; cursor:pointer;">&times;</button>
+            </div>
+
+            <!-- Safety Guarantee Notice -->
+            <div style="background:rgba(16, 185, 129, 0.12); border:1px solid var(--accent-green); border-radius:10px; padding:12px 16px; margin-bottom:18px; font-size:13px; color:var(--accent-green); display:flex; align-items:center; gap:10px;">
+                <span style="font-size:20px;">🛡️</span>
+                <div>
+                    <b>ضمان أمان الماكينة الصارم (Strictly Read-Only Guarantee):</b><br>
+                    الفحص يعمل بتقنية Layer-2 ARP والاستماع السلبي لحزم الشبكة. <b>ممنوع منعاً باتاً ومستحيل فيزيائياً إرسال أي باكت تعديل أو أمر كتابة أو مسح لكود الماكينة نهائياً.</b>
+                </div>
+            </div>
+
+            <div style="margin-bottom:16px; display:flex; gap:12px; flex-wrap:wrap; align-items:center;">
+                <label style="font-size:13px; color:var(--text-muted); font-weight:600;">نطاق الفحص الإضافي:</label>
+                <select id="disc-subnet" class="input-field" style="width:220px;">
+                    <option value="AUTO">كارت الشبكة الحالي (تلقائي)</option>
+                    <option value="ALL_COMMON">كافة نطاقات الماكينات الشائعة (192.168.0.x / 1.x / 2.x)</option>
+                    <option value="192.168.0.0/24">192.168.0.0/24 (شائع بماكينات Victor/الصيني)</option>
+                    <option value="192.168.1.0/24">192.168.1.0/24</option>
+                    <option value="192.168.2.0/24">192.168.2.0/24</option>
+                    <option value="10.10.10.0/24">10.10.10.0/24</option>
+                </select>
+                <button class="btn btn-primary" id="btn-start-disc" onclick="triggerDiscovery()">
+                    <span>🚀</span> بدء فحص الشبكة واكتشاف الماكينة
+                </button>
+            </div>
+
+            <!-- Progress bar -->
+            <div id="disc-progress-box" style="display:none; margin-bottom:16px;">
+                <div class="progress-bar-container" style="height:8px;">
+                    <div class="progress-fill" id="disc-progress-fill" style="width:0%;"></div>
+                </div>
+                <div id="disc-step-text" style="font-size:13px; color:var(--accent-cyan); font-weight:600;">جاري الفحص...</div>
+            </div>
+
+            <!-- Discovered Devices Table -->
+            <div id="disc-results" style="margin-top:14px;">
+                <table style="width:100%; border-collapse:collapse; font-size:13px;">
+                    <thead>
+                        <tr>
+                            <th>عنوان IP</th>
+                            <th>الماكينة / المصنّع</th>
+                            <th>المنافذ والبروتوكول</th>
+                            <th>الإجراء</th>
+                        </tr>
+                    </thead>
+                    <tbody id="disc-devices-body">
+                        <tr><td colspan="4" style="text-align:center; color:var(--text-muted); padding:20px;">اضغط على زر [بدء فحص الشبكة واكتشاف الماكينة] أعلاه للبحث التلقائي</td></tr>
+                    </tbody>
+                </table>
+            </div>
         </div>
     </div>
 
@@ -616,6 +740,113 @@ HTML_CONTENT = """
 
     <script>
         const states = { 0: "متوقفة (IDLE)", 1: "إغلاق البستم (CLAMP)", 2: "الكبس/التشغيل (PRESS)", 3: "التبريد (COOL)", 4: "الطرد (EJECT)" };
+
+        // Auto-Discovery Modal & Logic
+        function openDiscoveryModal() {
+            const modal = document.getElementById('discoveryModal');
+            if (modal) {
+                modal.style.display = 'flex';
+            }
+        }
+
+        function closeDiscoveryModal() {
+            const modal = document.getElementById('discoveryModal');
+            if (modal) {
+                modal.style.display = 'none';
+            }
+        }
+
+        let discInterval = null;
+        function triggerDiscovery() {
+            const subnetEl = document.getElementById('disc-subnet');
+            const subnetVal = subnetEl ? subnetEl.value : 'AUTO';
+            let custom = null;
+            if (subnetVal === 'ALL_COMMON') {
+                custom = ['192.168.0.0/24', '192.168.1.0/24', '192.168.2.0/24', '10.10.10.0/24'];
+            } else if (subnetVal !== 'AUTO') {
+                custom = [subnetVal];
+            }
+
+            const pBox = document.getElementById('disc-progress-box');
+            if (pBox) pBox.style.display = 'block';
+            const btn = document.getElementById('btn-start-disc');
+            if (btn) {
+                btn.disabled = true;
+                btn.innerText = 'جاري الفحص...';
+            }
+
+            fetch('/api/network/discover', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ custom_subnets: custom })
+            }).then(() => {
+                if (discInterval) clearInterval(discInterval);
+                discInterval = setInterval(pollDiscoveryStatus, 400);
+            }).catch(err => {
+                alert('فشل في بدء الفحص: ' + err);
+                if (btn) {
+                    btn.disabled = false;
+                    btn.innerText = '🚀 بدء فحص الشبكة واكتشاف الماكينة';
+                }
+            });
+        }
+
+        function pollDiscoveryStatus() {
+            fetch('/api/network/discover/status')
+                .then(r => r.json())
+                .then(st => {
+                    const pFill = document.getElementById('disc-progress-fill');
+                    const sText = document.getElementById('disc-step-text');
+                    if (pFill) pFill.style.width = `${st.progress_percent}%`;
+                    if (sText) sText.innerText = st.current_step;
+
+                    if (!st.is_scanning && st.result) {
+                        clearInterval(discInterval);
+                        discInterval = null;
+                        const btn = document.getElementById('btn-start-disc');
+                        if (btn) {
+                            btn.disabled = false;
+                            btn.innerText = '🚀 إعادة الفحص';
+                        }
+                        renderDiscoveredDevices(st.result.devices || []);
+                    }
+                });
+        }
+
+        function renderDiscoveredDevices(devs) {
+            const tbody = document.getElementById('disc-devices-body');
+            if (!tbody) return;
+            if (!devs || devs.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="4" style="text-align:center; color:var(--text-muted); padding:16px;">لم يتم العثور على أجهزة تستجيب على هذا النطاق. تأكد من توصيل كابل NET1 بالماكينة.</td></tr>';
+                return;
+            }
+            tbody.innerHTML = devs.map(d => {
+                const isPlc = d.is_industrial_plc;
+                const badge = isPlc ? '<span class="status-pill pill-normal">ماكينة / PLC</span>' : '<span class="status-pill" style="background:rgba(255,255,255,0.1);color:#FFF;">جهاز شبكة</span>';
+                const portsStr = d.open_ports && d.open_ports.length > 0 ? d.open_ports.map(p => `<b>${p}</b> (${d.protocol || 'ICS'})`).join(', ') : 'مغلقة';
+                const chooseBtn = `<button class="btn btn-primary" style="padding:6px 12px; font-size:12px;" onclick="selectDiscoveredDevice('${d.ip}', ${d.open_ports && d.open_ports[0] ? d.open_ports[0] : 'null'}, '${d.vendor}')">اختيار هذه الماكينة ✓</button>`;
+                return `
+                    <tr style="${isPlc ? 'background:rgba(6,182,212,0.08);' : ''}">
+                        <td><b style="color:var(--accent-cyan); font-size:14px;">${d.ip}</b><br>${badge}</td>
+                        <td><b style="color:#FFF;">${d.vendor}</b><br><small style="color:var(--text-muted); font-family:monospace;">${d.mac}</small></td>
+                        <td>${portsStr}</td>
+                        <td>${chooseBtn}</td>
+                    </tr>
+                `;
+            }).join('');
+        }
+
+        function selectDiscoveredDevice(ip, port, vendor) {
+            const ipEl = document.getElementById('plc-ip');
+            const portEl = document.getElementById('plc-port');
+            const stEl = document.getElementById('station-name');
+            if (ipEl) ipEl.value = ip;
+            if (portEl && port) portEl.value = port;
+            if (stEl && vendor && vendor !== 'Generic Industrial/Network Device') {
+                stEl.value = vendor.split(' ')[0] + '-Machine';
+            }
+            closeDiscoveryModal();
+        }
 
         // Chart setup
         const ctx = document.getElementById('telemetryChart').getContext('2d');

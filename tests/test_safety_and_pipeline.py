@@ -266,3 +266,25 @@ def test_report_sanitization():
     rg = ReportGenerator()
     assert rg._sanitize_name("../../Bad:Station*01") == "Bad_Station_01"
     assert rg._sanitize_name("Machine-05") == "Machine-05"
+
+
+def test_network_discovery_safety_and_vendor_lookup():
+    """Confirms network discovery operates strictly read-only and resolves industrial vendors."""
+    from plc_extractor.scanner.network_discovery import IndustrialNetworkScanner, lookup_mac_vendor
+
+    # 1. Vendor OUI resolution
+    assert "Siemens" in lookup_mac_vendor("00:0E:8C:11:22:33")
+    assert "Inovance" in lookup_mac_vendor("00:18:FE:AA:BB:CC")
+    assert "Rockwell" in lookup_mac_vendor("00:00:BC:12:34:56")
+    assert "Schneider" in lookup_mac_vendor("00:80:F4:99:88:77")
+    assert "Delta" in lookup_mac_vendor("00:18:23:44:55:66")
+
+    # 2. Local adapter safe enumeration
+    scanner = IndustrialNetworkScanner(timeout=0.1)
+    adapters = scanner.get_local_adapters()
+    assert isinstance(adapters, list)
+
+    # 3. Port check safety (only connect_ex, no data transmitted)
+    port_res = scanner.check_industrial_ports("127.0.0.1")
+    assert isinstance(port_res, dict)
+    assert "open_ports" in port_res

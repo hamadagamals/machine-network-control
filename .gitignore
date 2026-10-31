@@ -21,3 +21,4 @@ data/reports/*.md
 .idea/
 .DS_Store
 Thumbs.db
+data/reports/*.json
